@@ -1057,27 +1057,31 @@ class ExtFilterProxy(QSortFilterProxyModel):
         self._root_path = os.path.abspath(path)
         self.invalidateFilter()
 
-    def _is_ancestor_of_root(self, path: str) -> bool:
+    def _is_in_root(self, path: str) -> bool:
         if not self._root_path:
-            return False
-        root = self._root_path
-        # Autorise la racine elle-même et tous ses ancêtres (C:\, C:\Users, …)
-        if path == root:
             return True
-        if root.startswith(path.rstrip(os.sep) + os.sep):
+        root = os.path.normcase(os.path.abspath(self._root_path))
+        candidate = os.path.normcase(os.path.abspath(path))
+        if candidate == root:
             return True
-        return False
+        if root.endswith(os.sep):
+            return candidate.startswith(root)
+        return candidate.startswith(root + os.sep)
 
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
-        idx = self.sourceModel().index(source_row, 0, source_parent)
+        src = self.sourceModel()
+        idx = src.index(source_row, 0, source_parent)
         if not idx.isValid():
             return False
 
-        path = self.sourceModel().filePath(idx)
-        if self.sourceModel().isDir(idx):
-            return self._is_ancestor_of_root(os.path.abspath(path))
+        path = src.filePath(idx)
+        if not self._is_in_root(path):
+            return False
 
-        name = self.sourceModel().fileName(idx).lower()
+        if src.isDir(idx):
+            return True
+
+        name = src.fileName(idx).lower()
         return name.endswith(self.allowed_exts)
 
 
@@ -1213,6 +1217,8 @@ class N8NTab(QWidget):
         src_index = self.proxy.mapToSource(proxy_index)
         fullpath = self.fs_model.filePath(src_index)
         if not fullpath:
+            return
+        if self.fs_model.isDir(src_index):
             return
         if fullpath in self.selected_paths:
             for i in range(self.list_sel.count()):
