@@ -768,7 +768,8 @@ class N8NTab(QWidget):
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
 
-        self.worker = ProcTailWorker([n8n_bin], cwd=None, env=env, parent=self)
+        # Le CLI n8n nécessite une sous-commande explicite (ex: "start") pour démarrer le serveur.
+        self.worker = ProcTailWorker([n8n_bin, "start"], cwd=None, env=env, parent=self)
         self.worker.sig_line.connect(self.append_log)
         self.worker.sig_started.connect(self.on_started)
         self.worker.sig_done.connect(self.on_done)
