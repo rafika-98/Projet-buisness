@@ -426,7 +426,8 @@ class YoutubeTab(QWidget):
                 {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"},
                 {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
             ],
-            "keepvideo": False,
+            # On conserve la vidéo finale (MP4) en plus de l'extraction audio en MP3
+            "keepvideo": True,
             "quiet": True,
             "no_warnings": True,
             "continuedl": True,
