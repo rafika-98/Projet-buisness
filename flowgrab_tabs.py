@@ -1008,10 +1008,12 @@ class Main(QWidget):
         root = QVBoxLayout(self)
         tabs = QTabWidget()
         tabs.addTab(YoutubeTab(app_ref=QApplication.instance()), "YouTube")
-        tabs.addTab(ServeurTab(), "Serveur")
+        tabs.addTab(ComingSoonTab("À venir 1"), "À venir 1")
+        tabs.addTab(ComingSoonTab("À venir 2"), "À venir 2")
         tabs.addTab(ComingSoonTab("À venir 3"), "À venir 3")
         tabs.addTab(ComingSoonTab("À venir 4"), "À venir 4")
         tabs.addTab(SettingsTab(), "Paramètres généraux")
+        tabs.addTab(ServeurTab(), "Serveur")
         root.addWidget(tabs)
 
 # ---------------------- main ----------------------
