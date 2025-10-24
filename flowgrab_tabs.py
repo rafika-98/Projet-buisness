@@ -32,7 +32,7 @@ class Task:
 
 # ---------------------- Worker de téléchargement ----------------------
 class DownloadWorker(QThread):
-    sig_progress = Signal(int, int, float, int, str)     # downloaded, total, speed, eta, filename
+    sig_progress = Signal(object, object, float, int, str)     # downloaded, total, speed, eta, filename
     sig_status   = Signal(str)                           # statut court
     sig_done     = Signal(bool, str, dict)               # ok, message/chemin, info dict
 
@@ -51,11 +51,11 @@ class DownloadWorker(QThread):
                 raise Exception("Interrompu par l’utilisateur")
             st = d.get("status")
             if st == "downloading":
-                downloaded = d.get("downloaded_bytes", 0) or 0
-                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                speed = d.get("speed", 0.0) or 0.0
-                eta   = d.get("eta", 0) or 0
-                fn    = d.get("filename", "") or self.task.filename
+                downloaded = int(d.get("downloaded_bytes") or 0)
+                total = int(d.get("total_bytes") or d.get("total_bytes_estimate") or 0)
+                speed = float(d.get("speed") or 0.0)
+                eta   = int(d.get("eta") or 0)
+                fn    = d.get("filename") or self.task.filename or ""
                 self.sig_progress.emit(downloaded, total, speed, eta, fn)
             elif st == "finished":
                 fn = d.get("filename", "")
