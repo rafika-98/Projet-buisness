@@ -11,19 +11,11 @@ from PySide6.QtGui import QAction, QPalette, QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton,
     QListWidget, QListWidgetItem, QFileDialog, QLabel, QComboBox,
-    QProgressBar, QMessageBox, QGroupBox, QFormLayout, QTabWidget, QTableWidget,
+    QProgressBar, QMessageBox, QGroupBox, QTabWidget, QTableWidget,
     QTableWidgetItem, QAbstractItemView
 )
 from PySide6.QtWidgets import QTextEdit
 from yt_dlp import YoutubeDL
-
-# ---------------------- Profils de qualité -> format yt-dlp ----------------------
-PROFILE_FORMATS = {
-    "Auto": "bestvideo[height<=1080]+bestaudio/best/best",
-    "HQ (<=2160p)": "bestvideo[height<=2160]+bestaudio/best/best",
-    "LQ (<=480p)": "bestvideo[height<=480]+bestaudio/best/best",
-    # tu pourras ajouter "Mobile 720p" facilement ici
-}
 
 # ---------------------- Modèle de tâche ----------------------
 @dataclass
@@ -36,6 +28,7 @@ class Task:
     speed: float = 0.0
     eta: Optional[int] = None
     video_id: Optional[str] = None  # pour nettoyage
+    selected_fmt: Optional[str] = None
 
 # ---------------------- Worker de téléchargement ----------------------
 class DownloadWorker(QThread):
@@ -201,16 +194,6 @@ class YoutubeTab(QWidget):
     def build_ui(self):
         root = QVBoxLayout(self)
 
-        # ----- Paramètres -----
-        params = QGroupBox("Paramètres")
-        form = QFormLayout(params)
-
-        # Format (modifiable)
-        self.edit_fmt = QLineEdit(PROFILE_FORMATS["Auto"])
-        form.addRow("Sélecteur de format", self.edit_fmt)
-
-        root.addWidget(params)
-
         # ----- URLs + Inspecteur -----
         urls_box = QGroupBox("URLs")
         urls_layout = QVBoxLayout(urls_box)
@@ -223,45 +206,38 @@ class YoutubeTab(QWidget):
         btn_file  = QPushButton("Depuis .txt");    btn_file.clicked.connect(self.add_from_file)
         btn_clear_urls = QPushButton("Vider la liste"); btn_clear_urls.clicked.connect(self.clear_url_list)
         btn_open  = QPushButton("Ouvrir le dossier");   btn_open.clicked.connect(self.open_output_dir)
-        btn_inspect = QPushButton("Inspecter"); btn_inspect.clicked.connect(self.inspect_current_url)
         add_line.addWidget(self.edit_url)
         add_line.addWidget(btn_add)
         add_line.addWidget(btn_file)
         add_line.addWidget(btn_clear_urls)
         add_line.addWidget(btn_open)
-        add_line.addWidget(btn_inspect)
         urls_layout.addLayout(add_line)
 
         self.list = QListWidget()
         self.list.setContextMenuPolicy(Qt.ActionsContextMenu)
         act_del = QAction("Supprimer la sélection", self); act_del.triggered.connect(self.delete_selected)
         self.list.addAction(act_del)
+        self.list.currentItemChanged.connect(self.on_current_item_changed)
         urls_layout.addWidget(self.list)
 
         # Tableau formats
-        self.tbl = QTableWidget(0, 9)
+        self.tbl = QTableWidget(0, 10)
         self.tbl.setHorizontalHeaderLabels([
-            "ID video","Résolution","FPS","Ext/VC","Poids vidéo",
+            "✔","ID video","Résolution","FPS","Ext/VC","Poids vidéo",
             "ID audio","Audio","Poids audio","Total estimé"
         ])
         self.tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tbl.setSelectionMode(QAbstractItemView.SingleSelection)
         self.tbl.horizontalHeader().setStretchLastSection(True)
+        self.tbl.itemDoubleClicked.connect(self.on_format_double_click)
         urls_layout.addWidget(self.tbl)
-
-        apply_line = QHBoxLayout()
-        self.btn_use = QPushButton("Utiliser le format sélectionné")
-        self.btn_use.clicked.connect(self.apply_selected_format)
-        apply_line.addStretch(1); apply_line.addWidget(self.btn_use)
-        urls_layout.addLayout(apply_line)
 
         # ----- Contrôles -----
         ctrl = QHBoxLayout()
         self.btn_start = QPushButton("Démarrer"); self.btn_start.clicked.connect(self.start_queue)
         self.btn_stop  = QPushButton("Stop"); self.btn_stop.clicked.connect(self.stop_current)
-        self.btn_clear = QPushButton("Vider"); self.btn_clear.clicked.connect(self.clear_all)
-        ctrl.addWidget(self.btn_start); ctrl.addWidget(self.btn_stop); ctrl.addWidget(self.btn_clear)
+        ctrl.addWidget(self.btn_start); ctrl.addWidget(self.btn_stop)
         urls_layout.addLayout(ctrl)
         root.addWidget(urls_box)
 
@@ -308,27 +284,36 @@ class YoutubeTab(QWidget):
         if not url:
             return
         for i in range(self.list.count()):
-            if url in (self.list.item(i).text()):
+            exist_task: Task = self.list.item(i).data(Qt.UserRole)
+            if exist_task and exist_task.url == url:
                 QMessageBox.information(self, "Déjà présent", "Cette URL est déjà dans la liste.")
                 self.edit_url.clear()
                 return
-        self.append_task(url)
+        item = self.append_task(url)
+        self.list.setCurrentItem(item)
+        self.inspect_task(item)
         self.edit_url.clear()
 
     def add_from_file(self):
         p, _ = QFileDialog.getOpenFileName(self, "Fichier .txt", "", "Text (*.txt)")
         if not p: return
+        new_items: List[QListWidgetItem] = []
         for line in pathlib.Path(p).read_text(encoding="utf-8").splitlines():
             u = line.strip()
             if not u: continue
             exists = False
             for i in range(self.list.count()):
-                if u in (self.list.item(i).text()):
+                exist_task: Task = self.list.item(i).data(Qt.UserRole)
+                if exist_task and exist_task.url == u:
                     exists = True
                     break
             if exists:
                 continue
-            self.append_task(u)
+            new_items.append(self.append_task(u))
+        if new_items:
+            item = new_items[0]
+            self.list.setCurrentItem(item)
+            self.inspect_task(item)
 
     def delete_selected(self):
         for it in self.list.selectedItems():
@@ -336,41 +321,33 @@ class YoutubeTab(QWidget):
             if t in self.queue: self.queue.remove(t)
             self.list.takeItem(self.list.row(it))
 
-    def clear_all(self):
-        if self.current_worker and self.current_worker.isRunning():
-            QMessageBox.warning(self, "En cours", "Arrête d’abord le téléchargement en cours.")
-            return
-        self.queue.clear(); self.list.clear(); self.tbl.setRowCount(0)
-        self.bar.setValue(0)
-        self.lab_name.setText("Fichier : —")
-        self.lab_speed.setText("Vitesse : —")
-        self.lab_size.setText("Taille : —")
-        self.lab_eta.setText("ETA : —")
-
     # ---------- Inspecteur ----------
-    def inspect_current_url(self):
-        url = self.edit_url.text().strip()
-        if not url:
-            QMessageBox.information(self, "Info", "Colle une URL dans le champ.")
-            return
+    def on_current_item_changed(self, current: QListWidgetItem, previous: QListWidgetItem):
+        if current:
+            self.inspect_task(current)
+
+    def inspect_task(self, item: QListWidgetItem):
+        """Inspecte l'URL de l'item sélectionné et remplit le tableau."""
         self.tbl.setRowCount(0)
-        mp4_friendly = True
+        task: Task = item.data(Qt.UserRole)
+        if not task or not task.url:
+            return
 
         try:
             with YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
-                info = ydl.extract_info(url, download=False)
+                info = ydl.extract_info(task.url, download=False)
         except Exception as e:
             QMessageBox.warning(self, "Erreur", f"Impossible d’inspecter : {e}")
             return
 
         if info.get("entries"):
-            info = info["entries"][0]  # 1er de la playlist pour l’inspection
+            info = info["entries"][0]
         self.last_inspect_info = info
 
         formats = info.get("formats") or []
         duration = info.get("duration")
-        vlist = list_video_formats(formats, mp4_friendly)
-        abest = pick_best_audio(formats, mp4_friendly)
+        vlist = list_video_formats(formats, mp4_friendly=True)
+        abest = pick_best_audio(formats, mp4_friendly=True)
 
         for vf in vlist:
             vid_id = vf.get("format_id") or ""
@@ -388,46 +365,90 @@ class YoutubeTab(QWidget):
 
             total = (vsize or 0) + (asize or 0)
 
-            row = self.tbl.rowCount(); self.tbl.insertRow(row)
-            for col, val in enumerate([
-                vid_id, res, str(fps), vc,
-                human_size(vsize), aid, aname, human_size(asize), human_size(total)
-            ]):
+            row = self.tbl.rowCount()
+            self.tbl.insertRow(row)
+
+            chosen = f"{vid_id}+{aid}" if aid else vid_id
+            dot_item = QTableWidgetItem("●" if task.selected_fmt and task.selected_fmt == chosen else "")
+            dot_item.setTextAlignment(Qt.AlignCenter)
+            if dot_item.text():
+                dot_item.setForeground(QColor(0, 170, 0))
+            self.tbl.setItem(row, 0, dot_item)
+
+            values = [
+                vid_id,
+                res,
+                str(fps),
+                vc,
+                human_size(vsize),
+                aid,
+                aname,
+                human_size(asize),
+                human_size(total),
+            ]
+            for col, val in enumerate(values, start=1):
                 self.tbl.setItem(row, col, QTableWidgetItem(val))
 
         self.tbl.resizeColumnsToContents()
 
-    def apply_selected_format(self):
-        r = self.tbl.currentRow()
-        if r < 0:
-            QMessageBox.information(self, "Info", "Sélectionne une ligne dans le tableau.")
+    def on_format_double_click(self, it: QTableWidgetItem):
+        row = it.row()
+        item = self.list.currentItem()
+        if not item or row < 0:
             return
-        vid = self.tbl.item(r, 0).text().strip()
-        aid = self.tbl.item(r, 5).text().strip()
-        if not vid:
-            QMessageBox.warning(self, "Erreur", "Format vidéo invalide.")
+        task: Task = item.data(Qt.UserRole)
+        if not task:
             return
-        fmt = f"{vid}+{aid}" if aid else vid
-        self.edit_fmt.setText(fmt)
-        QMessageBox.information(self, "OK", f"Format sélectionné : {fmt}")
+
+        vid_item = self.tbl.item(row, 1)
+        if not vid_item:
+            return
+        vid = vid_item.text().strip()
+        aid_item = self.tbl.item(row, 6)
+        aid = aid_item.text().strip() if aid_item else ""
+        chosen = f"{vid}+{aid}" if aid else vid
+        task.selected_fmt = chosen
+
+        for r in range(self.tbl.rowCount()):
+            di = self.tbl.item(r, 0)
+            if di is None:
+                di = QTableWidgetItem("")
+                di.setTextAlignment(Qt.AlignCenter)
+                self.tbl.setItem(r, 0, di)
+            else:
+                di.setText("")
+                di.setTextAlignment(Qt.AlignCenter)
+                di.setForeground(QColor())
+
+        ok = self.tbl.item(row, 0)
+        if ok is None:
+            ok = QTableWidgetItem("")
+            self.tbl.setItem(row, 0, ok)
+        ok.setText("●")
+        ok.setTextAlignment(Qt.AlignCenter)
+        ok.setForeground(QColor(0, 170, 0))
+
+        self.statusBar(f"Format choisi : {chosen}")
 
     # ---------- Options yt-dlp ----------
-    def build_opts(self):
+    def build_opts(self, task: Task):
         outdir = OUT_DIR
-        fmt = self.edit_fmt.text().strip() or "bestvideo[height<=1080]+bestaudio/best/best"
-        if fmt.strip().startswith("best"):
-            fmt = "bestvideo[ext=mp4][vcodec*=avc1]+bestaudio[ext=m4a]/best[ext=mp4]"
+        fmt = task.selected_fmt or "bestvideo[ext=mp4][vcodec*=avc1]+bestaudio[ext=m4a]/best[ext=mp4]"
+
+        folder_tmpl = "%(title).200s [%(id)s]"
+        file_tmpl = "%(title).200s [%(id)s].%(ext)s"
+        outtmpl = str(outdir / folder_tmpl / file_tmpl)
 
         opts = {
-            "outtmpl": str(outdir / "%(title).200s [%(id)s].%(ext)s"),
+            "outtmpl": outtmpl,
+            "windowsfilenames": True,
             "format": fmt,
             "merge_output_format": "mp4",
             "postprocessors": [
                 {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"},
                 {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
             ],
-            # On conserve la vidéo finale (MP4) en plus de l'extraction audio en MP3
-            "keepvideo": True,
+            "keepvideo": False,
             "quiet": True,
             "no_warnings": True,
             "continuedl": True,
@@ -462,11 +483,12 @@ class YoutubeTab(QWidget):
         task.status = "En cours"
         item.setText(f"[En cours] {task.url}")
 
-        opts = self.build_opts()
+        opts = self.build_opts(task)
         self.current_worker = DownloadWorker(task, opts, self)
         self.current_worker.sig_progress.connect(lambda d, tot, sp, eta, fn: self.on_progress(item, task, d, tot, sp, eta, fn))
         self.current_worker.sig_status.connect(self.statusBar)
         self.current_worker.sig_done.connect(lambda ok, msg, info: self.on_done(item, task, ok, msg, info))
+        self.btn_start.setEnabled(False)
         self.current_worker.start()
 
     def stop_current(self):
@@ -500,6 +522,7 @@ class YoutubeTab(QWidget):
             QMessageBox.warning(self, "Erreur", f"Échec du téléchargement :\n{msg}")
         self.bar.setValue(0)
         self.current_worker = None
+        self.btn_start.setEnabled(True)
         QThread.msleep(200)
         self.start_queue()
 
@@ -508,50 +531,34 @@ class YoutubeTab(QWidget):
 
     def cleanup_residuals(self, task: Task):
         """
-        Supprime tout fichier intermédiaire lié au même ID :
-          - audio/vidéo bruts (.webm, .m4a, etc.)
-          - vidéo brute .fNNN.mp4 (.f137.mp4, .f248.mp4, etc.)
-        Conserve uniquement :
-          - Titre [ID].mp4 (final)
-          - Titre [ID].mp3 (final)
+        Supprime les fichiers intermédiaires liés au même ID dans le **sous-dossier** du titre :
+          - flux bruts (.webm, .m4a, etc.)
+          - .fNNN.mp4 (vidéo intermédiaire)
+        Conserve:
+          - Titre [ID].mp4
+          - Titre [ID].mp3
         """
         if not task.video_id:
             return
 
-        outdir = OUT_DIR
-        if not outdir.exists():
-            return
+        subdir = OUT_DIR / f"{pathlib.Path(task.filename).parent.name}"
+        if not subdir.exists():
+            subdir = OUT_DIR
 
         token = f"[{task.video_id}]"
-
-        for p in outdir.iterdir():
+        for p in subdir.iterdir():
             try:
-                if not p.is_file():
+                if not p.is_file() or token not in p.name:
                     continue
-                name = p.name
-                if token not in name:
-                    continue
-
                 ext = p.suffix.lower()
-
-                # Conserver systématiquement le MP3 final
                 if ext == ".mp3":
                     continue
-
-                # Conserver uniquement le MP4 FINAL (sans suffixe .fNNN)
                 if ext == ".mp4":
-                    # ex. "Titre [ID].f137.mp4" -> supprimer
-                    stem = p.stem  # nom sans extension
-                    if ".f" in stem:
-                        p.unlink()      # mp4 intermédiaire (itag)
-                    else:
-                        continue        # mp4 final
+                    if ".f" in p.stem:
+                        p.unlink()
                     continue
-
-                # Tout le reste (m4a, webm, mkv, opus, etc.) -> supprimer
                 p.unlink()
             except Exception:
-                # ignorer erreurs pour ne pas bloquer l'app
                 pass
 
 # ---------------------- Onglets placeholders ----------------------
