@@ -1,6 +1,7 @@
 import os, subprocess, shutil, sys, pathlib, mimetypes
 import signal
 import tempfile
+import threading
 
 OUT_DIR = pathlib.Path(r"C:\Users\Lamine\Desktop\Projet final\Application\downloads")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -29,6 +30,83 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
 )
 from PySide6.QtWidgets import QTextEdit
+
+try:
+    from flask import Flask
+except ImportError:  # pragma: no cover - dépend de l'environnement
+    Flask = None  # type: ignore[assignment]
+
+
+_notification_server_started = False
+_notification_parent_widget = None
+
+
+def _send_windows_notification(message: str) -> None:
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.Popen(
+            ["cmd", "/c", "msg", "*", message],
+            creationflags=creationflags,
+        )
+    except Exception:
+        pass
+
+
+def start_notification_server(parent_widget=None) -> None:
+    global _notification_server_started, _notification_parent_widget
+    if _notification_server_started:
+        return
+
+    _notification_parent_widget = parent_widget
+
+    if Flask is None:
+        def warn_missing_flask():
+            parent = _notification_parent_widget
+            QMessageBox.warning(
+                parent,
+                "Flask manquant",
+                "Impossible de démarrer le serveur de notification.\n"
+                "Installe Flask avec 'pip install flask' pour activer les notifications.",
+            )
+
+        QTimer.singleShot(0, warn_missing_flask)
+        _notification_server_started = True
+        return
+
+    flask_app = Flask("flowgrab-notify")
+
+    @flask_app.get("/notify-done")
+    def notify_done():  # pragma: no cover - exécuté via requête HTTP
+        def show_message_box():
+            parent = _notification_parent_widget
+            if parent is not None and hasattr(parent, "isVisible") and not parent.isVisible():
+                parent = None
+            if parent is None:
+                parent = QApplication.activeWindow()
+            QMessageBox.information(parent, "Notification N8N", "La transcription est terminée.")
+
+        QTimer.singleShot(0, show_message_box)
+        threading.Thread(target=_send_windows_notification, args=("La transcription est terminée.",), daemon=True).start()
+        return {"status": "ok"}
+
+    def run_flask():  # pragma: no cover - serveur en arrière-plan
+        try:
+            flask_app.run(host="0.0.0.0", port=5050, debug=False, use_reloader=False)
+        except Exception as exc:
+            def warn_error():
+                parent = _notification_parent_widget
+                QMessageBox.warning(
+                    parent,
+                    "Serveur Flask",
+                    f"Erreur lors du démarrage du serveur Flask : {exc}",
+                )
+
+            QTimer.singleShot(0, warn_error)
+
+    threading.Thread(target=run_flask, daemon=True).start()
+    _notification_server_started = True
 from yt_dlp import YoutubeDL
 
 # ---------------------- Modèle de tâche ----------------------
@@ -1295,6 +1373,7 @@ class Main(QWidget):
         tabs.addTab(SettingsTab(), "Paramètres généraux")
         tabs.addTab(ServeurTab(), "Serveur")
         root.addWidget(tabs)
+        start_notification_server(self)
 
 # ---------------------- main ----------------------
 if __name__ == "__main__":
