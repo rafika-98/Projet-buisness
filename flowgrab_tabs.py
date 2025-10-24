@@ -1,7 +1,30 @@
 import os, subprocess, shutil, sys, pathlib
 
-OUT_DIR = pathlib.Path(r"C:\Users\Lamine\Desktop\Projet\downloads")
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+def _determine_default_out_dir() -> pathlib.Path:
+    """Pick a writable download directory for the current user."""
+    candidates = [
+        pathlib.Path.home() / "Downloads" / "Flowgrab",
+        pathlib.Path.home() / "Flowgrab",
+        pathlib.Path(__file__).resolve().parent / "downloads",
+        pathlib.Path.cwd() / "downloads",
+    ]
+
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+        else:
+            return candidate
+
+    # If none of the candidates could be created, let the final attempt raise.
+    fallback = pathlib.Path(__file__).resolve().parent / "downloads"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+OUT_DIR = _determine_default_out_dir()
 from dataclasses import dataclass
 from typing import Optional, List, Dict
 
