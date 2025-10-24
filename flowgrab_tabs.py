@@ -6,7 +6,7 @@ DOWNLOAD_ARCHIVE = OUT_DIR / "archive.txt"
 from dataclasses import dataclass
 from typing import Optional, List, Dict
 
-from PySide6.QtCore import Qt, QThread, Signal, Slot, QUrl
+from PySide6.QtCore import Qt, QThread, Signal, Slot, QUrl, QTimer
 from PySide6.QtGui import QAction, QPalette, QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton,
@@ -102,6 +102,31 @@ class CommandWorker(QThread):
             self.sig_line.emit(f"[ERREUR] {e}")
             self.sig_done.emit(1)
 
+
+class InspectWorker(QThread):
+    sig_done  = Signal(str, dict)   # url, info
+    sig_error = Signal(str, str)    # url, message
+
+    def __init__(self, url: str, parent=None):
+        super().__init__(parent)
+        self.url = url
+
+    def run(self):
+        try:
+            ydl_opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "retries": 2,
+                "socket_timeout": 15,
+            }
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(self.url, download=False)
+            if info.get("entries"):
+                info = info["entries"][0]
+            self.sig_done.emit(self.url, info or {})
+        except Exception as e:
+            self.sig_error.emit(self.url, str(e))
+
 # ---------------------- Thèmes ----------------------
 def apply_dark_theme(app: QApplication):
     palette = QPalette()
@@ -189,6 +214,12 @@ class YoutubeTab(QWidget):
         self.queue: List[Task] = []
         self.current_worker: Optional[DownloadWorker] = None
         self.last_inspect_info: Dict = {}
+        self.inspect_worker = None
+        self.inspect_seq = 0            # numéro de requête pour ignorer les réponses obsolètes
+        self.inspect_debounce = QTimer(self)
+        self.inspect_debounce.setSingleShot(True)
+        self.inspect_debounce.setInterval(250)  # 250ms de debounce
+        self.inspect_debounce.timeout.connect(self._inspect_current_after_debounce)
         self.build_ui()
 
     def build_ui(self):
@@ -291,7 +322,7 @@ class YoutubeTab(QWidget):
                 return
         item = self.append_task(url)
         self.list.setCurrentItem(item)
-        self.inspect_task(item)
+        self.inspect_task_async(item)
         self.edit_url.clear()
 
     def add_from_file(self):
@@ -313,7 +344,7 @@ class YoutubeTab(QWidget):
         if new_items:
             item = new_items[0]
             self.list.setCurrentItem(item)
-            self.inspect_task(item)
+            self.inspect_task_async(item)
 
     def delete_selected(self):
         for it in self.list.selectedItems():
@@ -323,31 +354,56 @@ class YoutubeTab(QWidget):
 
     # ---------- Inspecteur ----------
     def on_current_item_changed(self, current: QListWidgetItem, previous: QListWidgetItem):
-        if current:
-            self.inspect_task(current)
+        # Debounce pour éviter de spammer l’inspect quand on navigue vite
+        self.inspect_debounce.start()
 
-    def inspect_task(self, item: QListWidgetItem):
-        """Inspecte l'URL de l'item sélectionné et remplit le tableau."""
-        self.tbl.setRowCount(0)
+    def _inspect_current_after_debounce(self):
+        item = self.list.currentItem()
+        if item:
+            self.inspect_task_async(item)
+
+    def inspect_task_async(self, item: QListWidgetItem):
+        """Démarre l'inspection en arrière-plan pour l'item donné."""
         task: Task = item.data(Qt.UserRole)
         if not task or not task.url:
             return
 
-        try:
-            with YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
-                info = ydl.extract_info(task.url, download=False)
-        except Exception as e:
-            QMessageBox.warning(self, "Erreur", f"Impossible d’inspecter : {e}")
+        # UI: état "Analyse…"
+        self.tbl.setRowCount(0)
+        self.statusBar("Analyse des formats…")
+        if QApplication.overrideCursor() is None:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+        self.btn_start.setEnabled(False)
+
+        # numéro de séquence pour ignorer les réponses tardives
+        self.inspect_seq += 1
+        seq = self.inspect_seq
+
+        # tuer le worker précédent s'il existe (on n'a pas d'annulation "forte" sur yt-dlp, mais on évite de mélanger les signaux)
+        if self.inspect_worker and self.inspect_worker.isRunning():
+            pass
+
+        w = InspectWorker(task.url, self)
+        self.inspect_worker = w
+        w.sig_done.connect(lambda url, info, s=seq: self.on_inspect_done(s, item, url, info))
+        w.sig_error.connect(lambda url, msg, s=seq: self.on_inspect_error(s, item, url, msg))
+        w.start()
+
+
+    def on_inspect_done(self, seq: int, item: QListWidgetItem, url: str, info: dict):
+        # ignorer si une requête plus récente a été lancée
+        if seq != self.inspect_seq:
             return
 
-        if info.get("entries"):
-            info = info["entries"][0]
-        self.last_inspect_info = info
+        self.last_inspect_info = info or {}
+        formats = self.last_inspect_info.get("formats") or []
+        duration = self.last_inspect_info.get("duration")
 
-        formats = info.get("formats") or []
-        duration = info.get("duration")
         vlist = list_video_formats(formats, mp4_friendly=True)
         abest = pick_best_audio(formats, mp4_friendly=True)
+
+        self.tbl.setRowCount(0)
+        task: Task = item.data(Qt.UserRole)
 
         for vf in vlist:
             vid_id = vf.get("format_id") or ""
@@ -368,28 +424,40 @@ class YoutubeTab(QWidget):
             row = self.tbl.rowCount()
             self.tbl.insertRow(row)
 
+            # Colonne 0 : point vert si format déjà choisi
             chosen = f"{vid_id}+{aid}" if aid else vid_id
-            dot_item = QTableWidgetItem("●" if task.selected_fmt and task.selected_fmt == chosen else "")
+            dot_item = QTableWidgetItem("●" if task and task.selected_fmt == chosen else "")
             dot_item.setTextAlignment(Qt.AlignCenter)
             if dot_item.text():
                 dot_item.setForeground(QColor(0, 170, 0))
             self.tbl.setItem(row, 0, dot_item)
 
-            values = [
-                vid_id,
-                res,
-                str(fps),
-                vc,
-                human_size(vsize),
-                aid,
-                aname,
-                human_size(asize),
-                human_size(total),
-            ]
+            values = [vid_id, res, str(fps), vc, human_size(vsize), aid, aname, human_size(asize), human_size(total)]
             for col, val in enumerate(values, start=1):
                 self.tbl.setItem(row, col, QTableWidgetItem(val))
 
         self.tbl.resizeColumnsToContents()
+        self.statusBar("Formats prêts")
+        try:
+            QApplication.restoreOverrideCursor()
+        except Exception:
+            pass
+        self.btn_start.setEnabled(True)
+        self.inspect_worker = None
+
+
+    def on_inspect_error(self, seq: int, item: QListWidgetItem, url: str, msg: str):
+        # ignorer si une requête plus récente a été lancée
+        if seq != self.inspect_seq:
+            return
+        try:
+            QApplication.restoreOverrideCursor()
+        except Exception:
+            pass
+        self.btn_start.setEnabled(True)
+        self.statusBar("Échec de l’analyse")
+        QMessageBox.warning(self, "Erreur", f"Impossible d’inspecter : {msg}")
+        self.inspect_worker = None
 
     def on_format_double_click(self, it: QTableWidgetItem):
         row = it.row()
@@ -448,7 +516,8 @@ class YoutubeTab(QWidget):
                 {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"},
                 {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
             ],
-            "keepvideo": False,
+            # IMPORTANT: garder la vidéo après l'extraction audio
+            "keepvideo": True,
             "quiet": True,
             "no_warnings": True,
             "continuedl": True,
