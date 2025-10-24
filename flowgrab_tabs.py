@@ -4,6 +4,12 @@ import tempfile
 
 OUT_DIR = pathlib.Path(r"C:\Users\Lamine\Desktop\Projet final\Application\downloads")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# --- AJOUT ---
+AUDIO_DIR = OUT_DIR / "Audios"
+VIDEO_DIR = OUT_DIR / "Videos"
+AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+VIDEO_DIR.mkdir(parents=True, exist_ok=True)
 DOWNLOAD_ARCHIVE = OUT_DIR / "archive.txt"
 from dataclasses import dataclass
 from typing import Optional, List, Dict
@@ -272,6 +278,31 @@ def estimate_size(stream: dict, duration: Optional[float]) -> Optional[float]:
     return None
 
 # ---------------------- Onglet YouTube ----------------------
+
+# --- AJOUT ---
+def unique_path(dst: pathlib.Path) -> pathlib.Path:
+    """Si dst existe, ajoute ' (1)', ' (2)', ... avant l'extension."""
+    if not dst.exists():
+        return dst
+    stem, suf = dst.stem, dst.suffix
+    i = 1
+    while True:
+        cand = dst.with_name(f"{stem} ({i}){suf}")
+        if not cand.exists():
+            return cand
+        i += 1
+
+
+def safe_move(src: pathlib.Path, dst_dir: pathlib.Path) -> pathlib.Path | None:
+    try:
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        dst = unique_path(dst_dir / src.name)
+        shutil.move(str(src), str(dst))
+        return dst
+    except Exception:
+        return None
+
+
 class YoutubeTab(QWidget):
     def __init__(self, app_ref, parent=None):
         super().__init__(parent)
@@ -649,6 +680,7 @@ class YoutubeTab(QWidget):
             item.setText(f"[Terminé] {task.url}")
             self.statusBar(f"Terminé : {msg}")
             task.video_id = (info or {}).get("id")
+            self.move_final_media(task)
             self.cleanup_residuals(task)
         else:
             task.status = "Erreur"
@@ -665,35 +697,72 @@ class YoutubeTab(QWidget):
 
     def cleanup_residuals(self, task: Task):
         """
-        Supprime les fichiers intermédiaires liés au même ID dans le **sous-dossier** du titre :
+        Supprime les fichiers intermédiaires dans le sous-dossier d'origine :
           - flux bruts (.webm, .m4a, etc.)
           - .fNNN.mp4 (vidéo intermédiaire)
         Conserve:
-          - Titre [ID].mp4
-          - Titre [ID].mp3
+          - Titre [ID].mp4 (déjà déplacée)
+          - Titre [ID].mp3 (déjà déplacée)
         """
-        if not task.video_id:
+        if not task.video_id or not task.filename:
             return
 
-        subdir = OUT_DIR / f"{pathlib.Path(task.filename).parent.name}"
+        subdir = pathlib.Path(task.filename).parent
         if not subdir.exists():
-            subdir = OUT_DIR
+            return
 
         token = f"[{task.video_id}]"
-        for p in subdir.iterdir():
+        for p in list(subdir.iterdir()):
             try:
                 if not p.is_file() or token not in p.name:
                     continue
                 ext = p.suffix.lower()
-                if ext == ".mp3":
-                    continue
+                # les finaux ont été déplacés; on ne touche qu'aux intermédiaires
                 if ext == ".mp4":
                     if ".f" in p.stem:
                         p.unlink()
                     continue
+                if ext == ".mp3":
+                    continue
                 p.unlink()
             except Exception:
                 pass
+
+    # --- AJOUT dans YoutubeTab ---
+    def move_final_media(self, task: Task):
+        """
+        Déplace les fichiers finaux:
+          - .mp4 (hors '.fNNN.mp4') => downloads/Videos/<Titre [ID]>/
+          - .mp3                    => downloads/Audios/<Titre [ID]>/
+        """
+        if not task.filename or not task.video_id:
+            return
+
+        src_subdir = pathlib.Path(task.filename).parent
+        if not src_subdir.exists():
+            return
+
+        token = f"[{task.video_id}]"
+        folder_name = src_subdir.name
+
+        # Déplacement
+        for p in list(src_subdir.iterdir()):
+            if not p.is_file():
+                continue
+            name = p.name
+            ext = p.suffix.lower()
+            if token not in name:
+                continue
+
+            # Intermédiaires .fNNN.mp4 : on NE déplace pas
+            if ext == ".mp4" and ".f" in p.stem:
+                continue
+
+            if ext == ".mp4":
+                safe_move(p, VIDEO_DIR / folder_name)
+            elif ext == ".mp3":
+                safe_move(p, AUDIO_DIR / folder_name)
+            # le reste (webm, m4a...) sera nettoyé par cleanup_residuals
 
 
 class ServeurTab(QWidget):
