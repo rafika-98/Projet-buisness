@@ -776,6 +776,7 @@ class N8NTab(QWidget):
 
     # ---------- Switch ----------
     def on_power_toggled(self, state: int):
+        self.append_log(f"### Toggle power -> state={state} (Checked={state==Qt.Checked})")
         if state == Qt.Checked:
             self.start_stack()
         else:
@@ -834,6 +835,8 @@ class N8NTab(QWidget):
                 ],
             )
             if not cf_bin:
+                self.append_log("!!! cloudflared introuvable. PATH actuel ci-dessous :")
+                self.append_log(f">>> PATH={os.environ.get('PATH','')}")
                 QMessageBox.warning(
                     self, "cloudflared introuvable",
                     "Installe cloudflared (winget install Cloudflare.cloudflared) ou ajoute-le au PATH."
