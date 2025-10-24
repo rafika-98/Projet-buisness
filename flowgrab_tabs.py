@@ -1,4 +1,5 @@
 import os, subprocess, shutil, sys, pathlib
+import re
 import signal
 
 OUT_DIR = pathlib.Path(r"C:\Users\Lamine\Desktop\Projet final\Application\downloads")
@@ -13,7 +14,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton,
     QListWidget, QListWidgetItem, QFileDialog, QLabel, QComboBox,
     QProgressBar, QMessageBox, QGroupBox, QTabWidget, QTableWidget,
-    QTableWidgetItem, QAbstractItemView
+    QTableWidgetItem, QAbstractItemView, QCheckBox
 )
 from PySide6.QtWidgets import QTextEdit
 from yt_dlp import YoutubeDL
@@ -694,105 +695,226 @@ class YoutubeTab(QWidget):
 
 # ---------------------- Onglet n8n ----------------------
 class N8NTab(QWidget):
+    CF_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com", re.I)
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.worker: ProcTailWorker | None = None
-        self._pid: int | None = None
+        self.n8n_worker: ProcTailWorker | None = None
+        self.cf_worker: ProcTailWorker | None = None
+        self.n8n_pid: int | None = None
+        self.cf_pid: int | None = None
+        self.public_url: str | None = None
+        self._wait_tries = 0
         self.build_ui()
 
     def build_ui(self):
         root = QVBoxLayout(self)
 
-        # Ligne options (Port + Ouvrir UI)
-        opts = QHBoxLayout()
-        opts.addWidget(QLabel("Port"))
+        # Ligne 1: Port + Exposer via Cloudflare + Ouvrir UI locale
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Port"))
         self.edit_port = QLineEdit("5678")
         self.edit_port.setFixedWidth(80)
-        self.btn_open_ui = QPushButton("Ouvrir l’UI")
-        self.btn_open_ui.clicked.connect(self.open_ui)
-        opts.addWidget(self.edit_port)
-        opts.addStretch(1)
-        opts.addWidget(self.btn_open_ui)
-        root.addLayout(opts)
 
-        # Boutons Start/Stop + statut
-        bar = QHBoxLayout()
-        self.btn_start = QPushButton("Démarrer n8n")
-        self.btn_stop = QPushButton("Stopper n8n")
-        self.btn_stop.setEnabled(False)
+        self.chk_cloudflare = QCheckBox("Exposer via Cloudflare")
+        self.btn_open_ui = QPushButton("Ouvrir l’UI locale")
+        self.btn_open_ui.clicked.connect(self.open_ui_local)
+
+        row1.addWidget(self.edit_port)
+        row1.addStretch(1)
+        row1.addWidget(self.chk_cloudflare)
+        row1.addWidget(self.btn_open_ui)
+        root.addLayout(row1)
+
+        # Ligne 2: URL publique (lecture seule) + copier/ouvrir
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("URL publique"))
+        self.edit_public = QLineEdit()
+        self.edit_public.setPlaceholderText("(non exposé)")
+        self.edit_public.setReadOnly(True)
+        self.btn_copy = QPushButton("Copier")
+        self.btn_copy.clicked.connect(self.copy_public)
+        self.btn_open_public = QPushButton("Ouvrir")
+        self.btn_open_public.clicked.connect(self.open_public)
+
+        row2.addWidget(self.edit_public, 1)
+        row2.addWidget(self.btn_copy)
+        row2.addWidget(self.btn_open_public)
+        root.addLayout(row2)
+
+        # Ligne 3: Switch unique + statut
+        row3 = QHBoxLayout()
+        self.chk_power = QCheckBox("Allumer n8n")
+        self.chk_power.stateChanged.connect(self.on_power_toggled)
         self.lab_status = QLabel("Statut : inactif")
-        self.btn_start.clicked.connect(self.on_start)
-        self.btn_stop.clicked.connect(self.on_stop)
-        bar.addWidget(self.btn_start)
-        bar.addWidget(self.btn_stop)
-        bar.addStretch(1)
-        bar.addWidget(self.lab_status)
-        root.addLayout(bar)
+        row3.addWidget(self.chk_power)
+        row3.addStretch(1)
+        row3.addWidget(self.lab_status)
+        root.addLayout(row3)
 
         # Logs
         self.logs = QTextEdit()
         self.logs.setReadOnly(True)
-        self.logs.setPlaceholderText("Logs du serveur n8n…")
+        self.logs.setPlaceholderText("Logs n8n / cloudflared…")
         root.addWidget(self.logs)
 
+    # ---------- Helpers UI ----------
     def append_log(self, text: str):
         self.logs.append(text)
 
-    def open_ui(self):
+    def open_ui_local(self):
         port = (self.edit_port.text() or "5678").strip()
-        url = QUrl(f"http://localhost:{port}")
-        QDesktopServices.openUrl(url)
+        QDesktopServices.openUrl(QUrl(f"http://localhost:{port}"))
 
-    def on_start(self):
-        if self.worker and self.worker.isRunning():
+    def copy_public(self):
+        if self.public_url:
+            QApplication.clipboard().setText(self.public_url)
+
+    def open_public(self):
+        if self.public_url:
+            QDesktopServices.openUrl(QUrl(self.public_url))
+
+    # ---------- Switch ----------
+    def on_power_toggled(self, state: int):
+        if state == Qt.Checked:
+            self.start_stack()
+        else:
+            self.stop_stack()
+
+    # ---------- Start: Cloudflare -> n8n ----------
+    def start_stack(self):
+        if self.n8n_worker and self.n8n_worker.isRunning():
             QMessageBox.information(self, "Déjà en cours", "n8n est déjà démarré.")
             return
 
-        # Trouver le binaire n8n
+        port = (self.edit_port.text() or "5678").strip()
+
+        # reset état
+        self.public_url = None
+        self.edit_public.setText("")
+        self._wait_tries = 0
+        self.lab_status.setText("Statut : démarrage…")
+        self.append_log(f">>> Démarrage stack (port {port})")
+
+        if self.chk_cloudflare.isChecked():
+            cf_bin = shutil.which("cloudflared")
+            if not cf_bin:
+                QMessageBox.warning(
+                    self, "cloudflared introuvable",
+                    "Installe cloudflared (winget install Cloudflare.cloudflared) ou ajoute-le au PATH."
+                )
+                self.chk_power.setChecked(False)
+                return
+
+            args = [cf_bin, "tunnel", "--url", f"http://localhost:{port}", "--ha-connections", "1", "--protocol", "quic"]
+            self.append_log(f">>> cloudflared: {' '.join(args)}")
+            self.cf_worker = ProcTailWorker(args, env=os.environ.copy(), parent=self)
+            self.cf_worker.sig_started.connect(self.on_cf_started)
+            self.cf_worker.sig_line.connect(self.on_cf_line)
+            self.cf_worker.sig_done.connect(self.on_cf_done)
+            self.cf_worker.start()
+
+            # attendre l'URL publique sans bloquer l’UI
+            QTimer.singleShot(500, self.try_launch_n8n)
+        else:
+            self.launch_n8n(port)
+
+    def on_cf_started(self, pid: int):
+        self.cf_pid = pid
+        self.append_log(f"[cloudflared] démarré (pid {pid})")
+
+    def on_cf_line(self, line: str):
+        self.append_log(f"[cloudflared] {line}")
+        m = self.CF_URL_RE.search(line)
+        if m and not self.public_url:
+            self.public_url = m.group(0)
+            self.edit_public.setText(self.public_url)
+            self.append_log(f"[cloudflared] URL publique : {self.public_url}")
+
+    def try_launch_n8n(self):
+        port = (self.edit_port.text() or "5678").strip()
+        if self.public_url or self._wait_tries >= 15 or not self.chk_cloudflare.isChecked():
+            self.launch_n8n(port)
+        else:
+            self._wait_tries += 1
+            QTimer.singleShot(500, self.try_launch_n8n)
+
+    def launch_n8n(self, port: str):
         n8n_bin = shutil.which("n8n")
         if not n8n_bin:
-            QMessageBox.warning(
-                self,
-                "n8n introuvable",
-                "Impossible de trouver 'n8n' dans le PATH.\n"
-                "Installe-le globalement (ex: npm i -g n8n) ou ajoute-le au PATH.",
-            )
+            QMessageBox.warning(self, "n8n introuvable",
+                                "Impossible de trouver 'n8n' dans le PATH. Installe-le (npm i -g n8n).")
+            self.stop_stack()
+            self.chk_power.setChecked(False)
             return
 
-        port = (self.edit_port.text() or "5678").strip()
         env = os.environ.copy()
         env["N8N_PORT"] = port
+        # Injecter URL publique si dispo
+        if self.public_url:
+            env["WEBHOOK_URL"] = self.public_url
+            env["N8N_EDITOR_BASE_URL"] = self.public_url
 
-        self.append_log(f">>> Lancement : {n8n_bin} (N8N_PORT={port})")
-        self.lab_status.setText("Statut : démarrage…")
-        self.btn_start.setEnabled(False)
-        self.btn_stop.setEnabled(True)
+        self.append_log(f">>> n8n: {n8n_bin} (N8N_PORT={port})")
+        self.n8n_worker = ProcTailWorker([n8n_bin], env=env, parent=self)
+        self.n8n_worker.sig_started.connect(self.on_n8n_started)
+        self.n8n_worker.sig_line.connect(lambda s: self.append_log(f"[n8n] {s}"))
+        self.n8n_worker.sig_done.connect(self.on_n8n_done)
+        self.n8n_worker.start()
 
-        self.worker = ProcTailWorker([n8n_bin], cwd=None, env=env, parent=self)
-        self.worker.sig_line.connect(self.append_log)
-        self.worker.sig_started.connect(self.on_started)
-        self.worker.sig_done.connect(self.on_done)
-        self.worker.start()
-
-    def on_started(self, pid: int):
-        self._pid = pid
+    def on_n8n_started(self, pid: int):
+        self.n8n_pid = pid
         self.lab_status.setText(f"Statut : en cours (pid {pid})")
+        self.append_log(f"[n8n] démarré (pid {pid})")
 
-    def on_stop(self):
-        if self.worker and self.worker.isRunning():
-            self.append_log(">>> Arrêt en cours…")
-            self.lab_status.setText("Statut : arrêt…")
-            self.worker.stop()
-        else:
-            QMessageBox.information(self, "Info", "n8n n’est pas en cours.")
+    # ---------- Stop ----------
+    def stop_stack(self):
+        self.lab_status.setText("Statut : arrêt…")
+        self.append_log(">>> Arrêt stack…")
 
-    def on_done(self, code: int):
-        self.append_log(f">>> n8n terminé (code={code})")
+        # Stop n8n
+        if self.n8n_worker and self.n8n_worker.isRunning():
+            self.append_log("[n8n] stop…")
+            self.n8n_worker.stop()
+        # Stop cloudflared
+        if self.cf_worker and self.cf_worker.isRunning():
+            self.append_log("[cloudflared] stop…")
+            self.cf_worker.stop()
+
+        # Kill dur si nécessaire (Windows), après 1.2s
+        QTimer.singleShot(1200, self.kill_hard_if_needed)
+
+    def kill_hard_if_needed(self):
+        if self.n8n_pid:
+            try:
+                subprocess.run(["taskkill", "/PID", str(self.n8n_pid), "/T", "/F"], capture_output=True, text=True)
+                self.append_log(f"[n8n] kill /PID {self.n8n_pid}")
+            except Exception:
+                pass
+        if self.cf_pid:
+            try:
+                subprocess.run(["taskkill", "/PID", str(self.cf_pid), "/T", "/F"], capture_output=True, text=True)
+                self.append_log(f"[cloudflared] kill /PID {self.cf_pid}")
+            except Exception:
+                pass
+
+        self.n8n_pid = None
+        self.cf_pid = None
+        self.n8n_worker = None
+        self.cf_worker = None
+        self.public_url = None
+        self.edit_public.setText("")
         self.lab_status.setText("Statut : inactif")
-        self.btn_start.setEnabled(True)
-        self.btn_stop.setEnabled(False)
-        self._pid = None
-        self.worker = None
+
+    # ---------- Callbacks fin ----------
+    def on_n8n_done(self, code: int):
+        self.append_log(f">>> n8n terminé (code={code})")
+        if self.cf_worker and self.cf_worker.isRunning():
+            self.append_log("[cloudflared] arrêt (n8n terminé)")
+            self.cf_worker.stop()
+
+    def on_cf_done(self, code: int):
+        self.append_log(f">>> cloudflared terminé (code={code})")
 
 
 # ---------------------- Onglets placeholders ----------------------
