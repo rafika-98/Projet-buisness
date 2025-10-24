@@ -1,14 +1,15 @@
-import sys
-import subprocess, shutil, sys
-import pathlib
+import os, subprocess, shutil, sys, pathlib
+
+OUT_DIR = pathlib.Path(r"C:\Users\Lamine\Desktop\Projet\downloads")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 from dataclasses import dataclass
 from typing import Optional, List, Dict
 
-from PySide6.QtCore import Qt, QThread, Signal, Slot
-from PySide6.QtGui import QAction, QPalette, QColor
+from PySide6.QtCore import Qt, QThread, Signal, Slot, QUrl
+from PySide6.QtGui import QAction, QPalette, QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton,
-    QListWidget, QListWidgetItem, QFileDialog, QLabel, QCheckBox, QComboBox,
+    QListWidget, QListWidgetItem, QFileDialog, QLabel, QComboBox,
     QProgressBar, QMessageBox, QGroupBox, QFormLayout, QTabWidget, QTableWidget,
     QTableWidgetItem, QAbstractItemView
 )
@@ -191,8 +192,6 @@ class YoutubeTab(QWidget):
     def __init__(self, app_ref, parent=None):
         super().__init__(parent)
         self.app_ref = app_ref
-        self.out_dir = pathlib.Path.cwd() / "downloads"
-        self.out_dir.mkdir(exist_ok=True, parents=True)
         self.queue: List[Task] = []
         self.current_worker: Optional[DownloadWorker] = None
         self.last_inspect_info: Dict = {}
@@ -205,48 +204,9 @@ class YoutubeTab(QWidget):
         params = QGroupBox("Paramètres")
         form = QFormLayout(params)
 
-        # Thème
-        theme_line = QHBoxLayout()
-        self.cmb_theme = QComboBox()
-        self.cmb_theme.addItems(["Clair", "Sombre"])
-        self.cmb_theme.currentIndexChanged.connect(self.on_theme_change)
-        theme_wrap = QWidget(); theme_wrap.setLayout(theme_line)
-        theme_line.addWidget(self.cmb_theme)
-        form.addRow("Thème", theme_wrap)
-
-        # Dossier de sortie
-        self.edit_out = QLineEdit(str(self.out_dir))
-        btn_browse = QPushButton("Parcourir…"); btn_browse.clicked.connect(self.choose_dir)
-        out_line = QHBoxLayout(); out_line.addWidget(self.edit_out); out_line.addWidget(btn_browse)
-        out_wrap = QWidget(); out_wrap.setLayout(out_line)
-        form.addRow("Dossier de sortie", out_wrap)
-
-        # Audio / Dual
-        self.chk_audio = QCheckBox("Audio uniquement (MP3)")
-        self.chk_dual  = QCheckBox("Sauvegarder aussi l’audio (MP3) en plus de la vidéo")
-        form.addRow(self.chk_audio)
-        form.addRow(self.chk_dual)
-
-        # MP4 friendly
-        self.chk_mp4 = QCheckBox("MP4-friendly (éviter WebM : H.264 + M4A)")
-        self.chk_mp4.setChecked(True)
-        form.addRow(self.chk_mp4)
-
-        # Profil qualité
-        self.cmb_profile = QComboBox()
-        self.cmb_profile.addItems(list(PROFILE_FORMATS.keys()))
-        self.cmb_profile.currentTextChanged.connect(self.on_profile_change)
-        form.addRow("Profil qualité", self.cmb_profile)
-
         # Format (modifiable)
         self.edit_fmt = QLineEdit(PROFILE_FORMATS["Auto"])
         form.addRow("Sélecteur de format", self.edit_fmt)
-
-        # Réseau
-        self.edit_rate = QLineEdit("")   # ex: 2M
-        self.edit_proxy = QLineEdit("")  # ex: http://127.0.0.1:7890
-        form.addRow("Limite de débit", self.edit_rate)
-        form.addRow("Proxy", self.edit_proxy)
 
         root.addWidget(params)
 
@@ -258,12 +218,17 @@ class YoutubeTab(QWidget):
         self.edit_url = QLineEdit()
         self.edit_url.setPlaceholderText("Colle une URL YouTube/playlist et presse Entrée pour l’ajouter")
         self.edit_url.returnPressed.connect(self.add_url)
-        btn_paste = QPushButton("Coller"); btn_paste.clicked.connect(lambda: self.edit_url.paste())
-        btn_add   = QPushButton("Ajouter"); btn_add.clicked.connect(self.add_url)
-        btn_file  = QPushButton("Depuis .txt"); btn_file.clicked.connect(self.add_from_file)
+        btn_add   = QPushButton("Ajouter");        btn_add.clicked.connect(self.add_url)
+        btn_file  = QPushButton("Depuis .txt");    btn_file.clicked.connect(self.add_from_file)
+        btn_clear_urls = QPushButton("Vider la liste"); btn_clear_urls.clicked.connect(self.clear_url_list)
+        btn_open  = QPushButton("Ouvrir le dossier");   btn_open.clicked.connect(self.open_output_dir)
         btn_inspect = QPushButton("Inspecter"); btn_inspect.clicked.connect(self.inspect_current_url)
-        add_line.addWidget(self.edit_url); add_line.addWidget(btn_paste); add_line.addWidget(btn_add)
-        add_line.addWidget(btn_file); add_line.addWidget(btn_inspect)
+        add_line.addWidget(self.edit_url)
+        add_line.addWidget(btn_add)
+        add_line.addWidget(btn_file)
+        add_line.addWidget(btn_clear_urls)
+        add_line.addWidget(btn_open)
+        add_line.addWidget(btn_inspect)
         urls_layout.addLayout(add_line)
 
         self.list = QListWidget()
@@ -316,44 +281,37 @@ class YoutubeTab(QWidget):
 
         self.setMinimumWidth(1080)
 
-        # Logique UI
-        self.chk_audio.toggled.connect(self.on_audio_toggle)
-        self.on_audio_toggle(self.chk_audio.isChecked())
+    def open_output_dir(self):
+        path = OUT_DIR
+        try:
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        except AttributeError:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        except Exception as e:
+            QMessageBox.warning(self, "Erreur", f"Impossible d’ouvrir le dossier : {e}")
 
-    # ---------- Thème ----------
-    def on_theme_change(self, _idx: int):
-        app = QApplication.instance()
-        if self.cmb_theme.currentText() == "Sombre":
-            apply_dark_theme(app)
-        else:
-            apply_light_theme(app)
+    def clear_url_list(self):
+        self.queue.clear()
+        self.list.clear()
 
-    # ---------- Helpers ----------
-    def on_profile_change(self, name: str):
-        if not self.chk_audio.isChecked():
-            base = PROFILE_FORMATS.get(name, PROFILE_FORMATS["Auto"])
-            if self.chk_mp4.isChecked():
-                base = "bestvideo[ext=mp4][vcodec*=avc1]+bestaudio[ext=m4a]/best[ext=mp4]"
-            self.edit_fmt.setText(base)
-
-    def on_audio_toggle(self, checked: bool):
-        self.cmb_profile.setEnabled(not checked)
-        self.edit_fmt.setEnabled(not checked)
-        self.chk_dual.setEnabled(not checked)
-        self.chk_mp4.setEnabled(not checked)
-
-    def choose_dir(self):
-        d = QFileDialog.getExistingDirectory(self, "Choisir le dossier")
-        if d: self.edit_out.setText(d)
-
-    def add_url(self):
-        url = self.edit_url.text().strip()
-        if not url: return
+    def append_task(self, url: str):
         t = Task(url=url)
         self.queue.append(t)
         item = QListWidgetItem(f"[En attente] {url}")
         item.setData(Qt.UserRole, t)
         self.list.addItem(item)
+        return item
+
+    def add_url(self):
+        url = self.edit_url.text().strip()
+        if not url:
+            return
+        for i in range(self.list.count()):
+            if url in (self.list.item(i).text()):
+                QMessageBox.information(self, "Déjà présent", "Cette URL est déjà dans la liste.")
+                self.edit_url.clear()
+                return
+        self.append_task(url)
         self.edit_url.clear()
 
     def add_from_file(self):
@@ -362,11 +320,14 @@ class YoutubeTab(QWidget):
         for line in pathlib.Path(p).read_text(encoding="utf-8").splitlines():
             u = line.strip()
             if not u: continue
-            t = Task(url=u)
-            self.queue.append(t)
-            it = QListWidgetItem(f"[En attente] {u}")
-            it.setData(Qt.UserRole, t)
-            self.list.addItem(it)
+            exists = False
+            for i in range(self.list.count()):
+                if u in (self.list.item(i).text()):
+                    exists = True
+                    break
+            if exists:
+                continue
+            self.append_task(u)
 
     def delete_selected(self):
         for it in self.list.selectedItems():
@@ -392,10 +353,10 @@ class YoutubeTab(QWidget):
             QMessageBox.information(self, "Info", "Colle une URL dans le champ.")
             return
         self.tbl.setRowCount(0)
-        mp4_friendly = self.chk_mp4.isChecked()
+        mp4_friendly = True
 
         try:
-            with YoutubeDL({"quiet": True, "no_warnings": True, "proxy": self.edit_proxy.text().strip() or None}) as ydl:
+            with YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
                 info = ydl.extract_info(url, download=False)
         except Exception as e:
             QMessageBox.warning(self, "Erreur", f"Impossible d’inspecter : {e}")
@@ -446,63 +407,31 @@ class YoutubeTab(QWidget):
             QMessageBox.warning(self, "Erreur", "Format vidéo invalide.")
             return
         fmt = f"{vid}+{aid}" if aid else vid
-        self.chk_audio.setChecked(False)  # force mode vidéo
         self.edit_fmt.setText(fmt)
         QMessageBox.information(self, "OK", f"Format sélectionné : {fmt}")
 
     # ---------- Options yt-dlp ----------
     def build_opts(self):
-        outdir = pathlib.Path(self.edit_out.text().strip())
-        outdir.mkdir(parents=True, exist_ok=True)
-
-        audio_only  = self.chk_audio.isChecked()
-        dual_output = (not audio_only) and self.chk_dual.isChecked()
-        mp4_friendly = self.chk_mp4.isChecked()
-
-        fmt  = None if audio_only else (self.edit_fmt.text().strip() or PROFILE_FORMATS["Auto"])
-        # IMPORTANT: ne remplace le format par MP4-friendly que si c'est un profil "best…",
-        # pas si l'utilisateur a choisi explicitement "137+140"
-        if (not audio_only) and mp4_friendly and fmt.strip().startswith("best"):
+        outdir = OUT_DIR
+        fmt = self.edit_fmt.text().strip() or "bestvideo[height<=1080]+bestaudio/best/best"
+        if fmt.strip().startswith("best"):
             fmt = "bestvideo[ext=mp4][vcodec*=avc1]+bestaudio[ext=m4a]/best[ext=mp4]"
-
-        rate = self.edit_rate.text().strip() or None
-        proxy= self.edit_proxy.text().strip() or None
-
-        if audio_only:
-            fmt_selector = "bestaudio/best"
-            postprocessors = [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }]
-            keepvideo = None
-        else:
-            fmt_selector = fmt
-            if dual_output:
-                postprocessors = [
-                    {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"},
-                    {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
-                ]
-                keepvideo = True  # conserve la vidéo lors de l’extraction MP3
-            else:
-                postprocessors = [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}]
-                keepvideo = None
 
         opts = {
             "outtmpl": str(outdir / "%(title).200s [%(id)s].%(ext)s"),
-            "format": fmt_selector,
+            "format": fmt,
             "merge_output_format": "mp4",
-            "postprocessors": postprocessors,
-            "ratelimit": rate,
-            "proxy": proxy,
+            "postprocessors": [
+                {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"},
+                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
+            ],
+            "keepvideo": True,
             "quiet": True,
             "no_warnings": True,
             "continuedl": True,
             "concurrent_fragment_downloads": 4,
             "noplaylist": False,
         }
-        if keepvideo:
-            opts["keepvideo"] = True
         return opts
 
     # ---------- File d’attente ----------
@@ -575,7 +504,7 @@ class YoutubeTab(QWidget):
     def cleanup_residuals(self, task: Task):
         """Supprime les fichiers WebM/M4A du même ID pour ne garder que .mp4/.mp3"""
         if not task.video_id: return
-        outdir = pathlib.Path(self.edit_out.text().strip())
+        outdir = OUT_DIR
         if not outdir.exists(): return
         for p in outdir.glob(f"*[{task.video_id}].*"):
             if p.suffix.lower() not in (".mp4", ".mp3"):
@@ -605,6 +534,16 @@ class SettingsTab(QWidget):
     def build_ui(self):
         root = QVBoxLayout(self)
 
+        theme_line = QHBoxLayout()
+        theme_label = QLabel("Thème")
+        self.cmb_theme = QComboBox()
+        self.cmb_theme.addItems(["Clair", "Sombre"])
+        self.cmb_theme.currentIndexChanged.connect(self.on_theme_change)
+        theme_line.addWidget(theme_label)
+        theme_line.addWidget(self.cmb_theme)
+        theme_line.addStretch(1)
+        root.addLayout(theme_line)
+
         # Ligne boutons
         line = QHBoxLayout()
         self.btn_update = QPushButton("Mettre à jour l’app (git pull origin main)")
@@ -627,6 +566,15 @@ class SettingsTab(QWidget):
         root.addWidget(info)
 
     # ---------- Actions ----------
+    def on_theme_change(self, _idx: int):
+        app = QApplication.instance()
+        if not app:
+            return
+        if self.cmb_theme.currentText() == "Sombre":
+            apply_dark_theme(app)
+        else:
+            apply_light_theme(app)
+
     def on_update_clicked(self):
         git_exe = shutil.which("git")
         if not git_exe:
