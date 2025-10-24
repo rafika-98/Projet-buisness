@@ -1,4 +1,5 @@
 import sys
+import subprocess, shutil, sys
 import pathlib
 from dataclasses import dataclass
 from typing import Optional, List, Dict
@@ -11,6 +12,7 @@ from PySide6.QtWidgets import (
     QProgressBar, QMessageBox, QGroupBox, QFormLayout, QTabWidget, QTableWidget,
     QTableWidgetItem, QAbstractItemView
 )
+from PySide6.QtWidgets import QTextEdit
 from yt_dlp import YoutubeDL
 
 # ---------------------- Profils de qualité -> format yt-dlp ----------------------
@@ -74,6 +76,36 @@ class DownloadWorker(QThread):
             self.sig_done.emit(True, fn, info or {})
         except Exception as e:
             self.sig_done.emit(False, str(e), {})
+
+class CommandWorker(QThread):
+    sig_line = Signal(str)      # lignes de log
+    sig_done = Signal(int)      # code retour
+
+    def __init__(self, cmd: list[str], cwd: pathlib.Path | None = None, env: dict | None = None, parent=None):
+        super().__init__(parent)
+        self.cmd = cmd
+        self.cwd = str(cwd) if cwd else None
+        self.env = env
+
+    def run(self):
+        try:
+            proc = subprocess.Popen(
+                self.cmd,
+                cwd=self.cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=self.env,
+                shell=False,
+            )
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                self.sig_line.emit(line.rstrip())
+            proc.wait()
+            self.sig_done.emit(proc.returncode or 0)
+        except Exception as e:
+            self.sig_line.emit(f"[ERREUR] {e}")
+            self.sig_done.emit(1)
 
 # ---------------------- Thèmes ----------------------
 def apply_dark_theme(app: QApplication):
@@ -559,6 +591,96 @@ class ComingSoonTab(QWidget):
         lbl.setAlignment(Qt.AlignCenter)
         lay.addWidget(lbl)
 
+class SettingsTab(QWidget):
+    """
+    Onglet Paramètres généraux :
+    - Bouton 'Mettre à jour l’app' -> git pull origin main
+    - Bouton 'Redémarrer l’app'    -> relance le process et quitte l’instance actuelle
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.worker: CommandWorker | None = None
+        self.build_ui()
+
+    def build_ui(self):
+        root = QVBoxLayout(self)
+
+        # Ligne boutons
+        line = QHBoxLayout()
+        self.btn_update = QPushButton("Mettre à jour l’app (git pull origin main)")
+        self.btn_restart = QPushButton("Redémarrer l’app")
+        self.btn_update.clicked.connect(self.on_update_clicked)
+        self.btn_restart.clicked.connect(self.on_restart_clicked)
+        line.addWidget(self.btn_update)
+        line.addWidget(self.btn_restart)
+        root.addLayout(line)
+
+        # Zone de logs
+        self.logs = QTextEdit()
+        self.logs.setReadOnly(True)
+        self.logs.setPlaceholderText("Logs des opérations (git, etc.)...")
+        root.addWidget(self.logs)
+
+        # Info
+        info = QLabel("Astuce : l’app cherchera la racine du dépôt (.git) en remontant depuis le dossier du script.")
+        info.setWordWrap(True)
+        root.addWidget(info)
+
+    # ---------- Actions ----------
+    def on_update_clicked(self):
+        git_exe = shutil.which("git")
+        if not git_exe:
+            QMessageBox.warning(self, "Git introuvable", "Impossible de trouver 'git' dans le PATH.")
+            return
+
+        repo_root = self.find_git_root()
+        if not repo_root:
+            QMessageBox.warning(self, "Hors dépôt Git", "Aucun dossier '.git' trouvé en remontant depuis ce projet.")
+            return
+
+        self.append_log(f">>> cwd: {repo_root}")
+        self.append_log(">>> git pull origin main")
+        self.btn_update.setEnabled(False)
+
+        self.worker = CommandWorker([git_exe, "pull", "origin", "main"], cwd=repo_root)
+        self.worker.sig_line.connect(self.append_log)
+        self.worker.sig_done.connect(self.on_update_done)
+        self.worker.start()
+
+    def on_update_done(self, code: int):
+        self.append_log(f">>> Terminé (code retour = {code})")
+        self.btn_update.setEnabled(True)
+        if code != 0:
+            QMessageBox.warning(self, "Échec mise à jour", "La commande git s'est terminée avec une erreur.\nConsulte les logs.")
+        else:
+            QMessageBox.information(self, "Mise à jour OK", "Pull terminé. Clique sur 'Redémarrer l’app' pour prendre en compte les changements.")
+
+    def on_restart_clicked(self):
+        # Relance le même script avec les mêmes arguments
+        try:
+            subprocess.Popen([sys.executable, *sys.argv], close_fds=True)
+        except Exception as e:
+            QMessageBox.warning(self, "Erreur", f"Impossible de redémarrer : {e}")
+            return
+        QApplication.instance().quit()
+
+    # ---------- Utils ----------
+    def append_log(self, text: str):
+        self.logs.append(text)
+
+    def find_git_root(self) -> Optional[pathlib.Path]:
+        """
+        Remonte depuis le dossier du script pour trouver un répertoire contenant '.git'.
+        """
+        p = pathlib.Path(__file__).resolve().parent
+        for parent in [p, *p.parents]:
+            if (parent / ".git").exists():
+                return parent
+        # dernier essai : si on exécute depuis un dossier qui a .git
+        if (pathlib.Path.cwd() / ".git").exists():
+            return pathlib.Path.cwd()
+        return None
+
 # ---------------------- Fenêtre principale ----------------------
 class Main(QWidget):
     def __init__(self):
@@ -569,6 +691,9 @@ class Main(QWidget):
         tabs.addTab(YoutubeTab(app_ref=QApplication.instance()), "YouTube")
         tabs.addTab(ComingSoonTab("À venir 1"), "À venir 1")
         tabs.addTab(ComingSoonTab("À venir 2"), "À venir 2")
+        tabs.addTab(ComingSoonTab("À venir 3"), "À venir 3")
+        tabs.addTab(ComingSoonTab("À venir 4"), "À venir 4")
+        tabs.addTab(SettingsTab(), "Paramètres généraux")
         root.addWidget(tabs)
 
 # ---------------------- main ----------------------
