@@ -4,12 +4,10 @@ import tempfile
 
 OUT_DIR = pathlib.Path(r"C:\Users\Lamine\Desktop\Projet final\Application\downloads")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-# --- AJOUT ---
-AUDIO_DIR = OUT_DIR / "Audios"
-VIDEO_DIR = OUT_DIR / "Videos"
-AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+VIDEOS_DIR = OUT_DIR / "Videos"
+AUDIOS_DIR = OUT_DIR / "Audios"
+VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
+AUDIOS_DIR.mkdir(parents=True, exist_ok=True)
 DOWNLOAD_ARCHIVE = OUT_DIR / "archive.txt"
 from dataclasses import dataclass
 from typing import Optional, List, Dict
@@ -277,31 +275,71 @@ def estimate_size(stream: dict, duration: Optional[float]) -> Optional[float]:
         return float(tbr) * 1000.0 / 8.0 * float(duration)
     return None
 
-# ---------------------- Onglet YouTube ----------------------
-
-# --- AJOUT ---
-def unique_path(dst: pathlib.Path) -> pathlib.Path:
-    """Si dst existe, ajoute ' (1)', ' (2)', ... avant l'extension."""
+# ---------------------- Utilitaires de fichiers ----------------------
+def _unique_path(dst: pathlib.Path) -> pathlib.Path:
+    """
+    Retourne un chemin libre en ajoutant -1, -2, ... si 'dst' existe déjà.
+    """
     if not dst.exists():
         return dst
-    stem, suf = dst.stem, dst.suffix
+    stem, suffix = dst.stem, dst.suffix
     i = 1
     while True:
-        cand = dst.with_name(f"{stem} ({i}){suf}")
+        cand = dst.with_name(f"{stem}-{i}{suffix}")
         if not cand.exists():
             return cand
         i += 1
 
 
-def safe_move(src: pathlib.Path, dst_dir: pathlib.Path) -> pathlib.Path | None:
-    try:
-        dst_dir.mkdir(parents=True, exist_ok=True)
-        dst = unique_path(dst_dir / src.name)
-        shutil.move(str(src), str(dst))
-        return dst
-    except Exception:
-        return None
+def move_final_outputs(task: Task):
+    """
+    Déplace les fichiers finaux (.mp4, .mp3) du sous-dossier 'Titre [ID]'
+    vers 'Videos' et 'Audios' (à plat). Gère les collisions de noms.
+    """
+    if not task.video_id or not task.filename:
+        return
 
+    try:
+        src_dir = pathlib.Path(task.filename).parent
+        token = f"[{task.video_id}]"
+
+        for p in list(src_dir.glob(f"*{token}*")):
+            if not p.is_file():
+                continue
+            ext = p.suffix.lower()
+
+            # .mp4 final: on exclut les fichiers intermédiaires de type ".fNNN.mp4"
+            if ext == ".mp4" and ".f" not in p.stem:
+                dst_dir = VIDEOS_DIR
+            # .mp3 final
+            elif ext == ".mp3":
+                dst_dir = AUDIOS_DIR
+            else:
+                continue
+
+            dst = _unique_path(dst_dir / p.name)
+            try:
+                p.replace(dst)  # atomique si même volume
+            except Exception:
+                shutil.move(str(p), str(dst))
+    except Exception:
+        # on ne casse pas le flux si un move échoue
+        pass
+
+
+def delete_dir_if_empty(path: pathlib.Path):
+    """
+    Supprime 'path' s'il est vide (ignore erreurs).
+    """
+    try:
+        if path.is_dir():
+            # re-liste après les déplacements / nettoyages
+            if not any(path.iterdir()):
+                path.rmdir()
+    except Exception:
+        pass
+
+# ---------------------- Onglet YouTube ----------------------
 
 class YoutubeTab(QWidget):
     def __init__(self, app_ref, parent=None):
@@ -680,8 +718,14 @@ class YoutubeTab(QWidget):
             item.setText(f"[Terminé] {task.url}")
             self.statusBar(f"Terminé : {msg}")
             task.video_id = (info or {}).get("id")
-            self.move_final_media(task)
+            move_final_outputs(task)
             self.cleanup_residuals(task)
+            try:
+                if task.filename:
+                    subdir = OUT_DIR / pathlib.Path(task.filename).parent.name
+                    delete_dir_if_empty(subdir)
+            except Exception:
+                pass
         else:
             task.status = "Erreur"
             item.setText(f"[Erreur] {task.url}")
@@ -727,42 +771,6 @@ class YoutubeTab(QWidget):
                 p.unlink()
             except Exception:
                 pass
-
-    # --- AJOUT dans YoutubeTab ---
-    def move_final_media(self, task: Task):
-        """
-        Déplace les fichiers finaux:
-          - .mp4 (hors '.fNNN.mp4') => downloads/Videos/<Titre [ID]>/
-          - .mp3                    => downloads/Audios/<Titre [ID]>/
-        """
-        if not task.filename or not task.video_id:
-            return
-
-        src_subdir = pathlib.Path(task.filename).parent
-        if not src_subdir.exists():
-            return
-
-        token = f"[{task.video_id}]"
-        folder_name = src_subdir.name
-
-        # Déplacement
-        for p in list(src_subdir.iterdir()):
-            if not p.is_file():
-                continue
-            name = p.name
-            ext = p.suffix.lower()
-            if token not in name:
-                continue
-
-            # Intermédiaires .fNNN.mp4 : on NE déplace pas
-            if ext == ".mp4" and ".f" in p.stem:
-                continue
-
-            if ext == ".mp4":
-                safe_move(p, VIDEO_DIR / folder_name)
-            elif ext == ".mp3":
-                safe_move(p, AUDIO_DIR / folder_name)
-            # le reste (webm, m4a...) sera nettoyé par cleanup_residuals
 
 
 class ServeurTab(QWidget):
