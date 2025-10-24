@@ -1,4 +1,4 @@
-import os, subprocess, shutil, sys, pathlib
+import os, subprocess, shutil, sys, pathlib, mimetypes
 import signal
 import tempfile
 
@@ -12,16 +12,43 @@ DOWNLOAD_ARCHIVE = OUT_DIR / "archive.txt"
 from dataclasses import dataclass
 from typing import Optional, List, Dict
 
-from PySide6.QtCore import Qt, QThread, Signal, Slot, QUrl, QTimer
+from PySide6.QtCore import (
+    Qt,
+    QThread,
+    Signal,
+    Slot,
+    QUrl,
+    QTimer,
+    QSortFilterProxyModel,
+    QModelIndex,
+    QDir,
+)
 from PySide6.QtGui import QAction, QPalette, QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton,
     QListWidget, QListWidgetItem, QFileDialog, QLabel, QComboBox,
     QProgressBar, QMessageBox, QGroupBox, QTabWidget, QTableWidget,
-    QTableWidgetItem, QAbstractItemView
+    QTableWidgetItem,
+    QAbstractItemView,
+    QTreeView,
+    QFileSystemModel,
 )
 from PySide6.QtWidgets import QTextEdit
 from yt_dlp import YoutubeDL
+
+# ---------------------- Constantes N8N ----------------------
+ALLOWED_N8N_EXTS = (
+    ".mp3",
+    ".m4a",
+    ".wav",
+    ".aac",
+    ".ogg",
+    ".flac",
+    ".mp4",
+    ".mkv",
+    ".webm",
+)
+DEFAULT_N8N_DIR = str(AUDIOS_DIR)
 
 # ---------------------- Modèle de tâche ----------------------
 @dataclass
@@ -959,6 +986,267 @@ Write-Host "Terminé."
             self.ps_file = None
 
 
+# ---------------------- Onglet N8N ----------------------
+class MultiUploadWorker(QThread):
+    sig_log = Signal(str)
+    sig_done = Signal(bool)
+
+    def __init__(self, url: str, files: List[str], parent=None):
+        super().__init__(parent)
+        self.url = url
+        self.files = list(files)
+
+    def run(self):
+        try:
+            import requests
+        except ImportError:
+            self.sig_log.emit("Erreur : le module 'requests' est introuvable. Exécute `pip install requests`.\n")
+            self.sig_done.emit(False)
+            return
+
+        if not self.files:
+            self.sig_log.emit("Aucun fichier à envoyer.\n")
+            self.sig_done.emit(False)
+            return
+
+        all_ok = True
+        self.sig_log.emit(f">>> Envoi vers {self.url} — {len(self.files)} fichier(s)\n")
+        for path in self.files:
+            if not os.path.exists(path):
+                self.sig_log.emit(f"[SKIP] Introuvable : {path}\n")
+                all_ok = False
+                continue
+
+            mime, _ = mimetypes.guess_type(path)
+            mime = mime or "application/octet-stream"
+            basename = os.path.basename(path)
+            self.sig_log.emit(f"POST {self.url}\n  -> {basename} (MIME={mime})  field='data'")
+
+            try:
+                with open(path, "rb") as handle:
+                    files = {"data": (basename, handle, mime)}
+                    resp = requests.post(self.url, files=files, timeout=180)
+                self.sig_log.emit(f"HTTP {resp.status_code}")
+                body = resp.text or ""
+                if len(body) > 1500:
+                    body = body[:1500] + "\n...[tronqué]..."
+                if body.strip():
+                    self.sig_log.emit(body + "\n")
+                if resp.status_code == 404 and "did you mean get" in body.lower():
+                    self.sig_log.emit(
+                        "Indice : sur un webhook-test, clique sur 'Listen for test event' avant d'envoyer.\n"
+                    )
+                if not (200 <= resp.status_code < 300):
+                    all_ok = False
+            except Exception as exc:
+                all_ok = False
+                self.sig_log.emit(f"[ERREUR réseau] {exc}\n")
+
+        self.sig_log.emit(">>> Terminé.\n")
+        self.sig_done.emit(all_ok)
+
+
+class ExtFilterProxy(QSortFilterProxyModel):
+    def __init__(self, allowed_exts: tuple[str, ...], parent=None):
+        super().__init__(parent)
+        self.allowed_exts = tuple(ext.lower() for ext in allowed_exts)
+
+    def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
+        idx = self.sourceModel().index(source_row, 0, source_parent)
+        if not idx.isValid():
+            return False
+        if self.sourceModel().isDir(idx):
+            return False
+        name = self.sourceModel().fileName(idx).lower()
+        return name.endswith(self.allowed_exts)
+
+
+class N8NTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.selected_paths: set[str] = set()
+        self.worker: MultiUploadWorker | None = None
+        self.proxy: ExtFilterProxy | None = None
+        self.build_ui()
+        self.load_dir(DEFAULT_N8N_DIR)
+        self.update_send_button()
+
+    # --- UI construction ---
+    def build_ui(self):
+        root = QVBoxLayout(self)
+
+        # URL webhook
+        url_row = QHBoxLayout()
+        url_row.addWidget(QLabel("Webhook URL:"))
+        self.edit_url = QLineEdit()
+        self.edit_url.setPlaceholderText(
+            "https://...trycloudflare.com/webhook-test/XXXX  (ou …/webhook/XXXX)"
+        )
+        url_row.addWidget(self.edit_url, 1)
+        root.addLayout(url_row)
+
+        # Dossier + boutons
+        dir_row = QHBoxLayout()
+        dir_row.addWidget(QLabel("Dossier:"))
+        self.edit_dir = QLineEdit()
+        self.edit_dir.setReadOnly(True)
+        dir_row.addWidget(self.edit_dir, 1)
+        self.btn_change = QPushButton("Changer…")
+        self.btn_change.clicked.connect(self.change_dir)
+        self.btn_open = QPushButton("Ouvrir le dossier")
+        self.btn_open.clicked.connect(self.open_dir)
+        dir_row.addWidget(self.btn_change)
+        dir_row.addWidget(self.btn_open)
+        root.addLayout(dir_row)
+
+        # Navigateur + sélection
+        mid_row = QHBoxLayout()
+
+        self.fs_model = QFileSystemModel(self)
+        self.fs_model.setFilter(QDir.AllEntries | QDir.NoDotAndDotDot | QDir.Readable)
+        self.proxy = ExtFilterProxy(ALLOWED_N8N_EXTS, self)
+        self.proxy.setSourceModel(self.fs_model)
+
+        self.view = QTreeView()
+        self.view.setModel(self.proxy)
+        self.view.setRootIsDecorated(False)
+        self.view.setAlternatingRowColors(True)
+        self.view.setSortingEnabled(True)
+        self.view.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.view.sortByColumn(0, Qt.AscendingOrder)
+        self.view.doubleClicked.connect(self.on_file_double_clicked)
+        mid_row.addWidget(self.view, 2)
+
+        right_col = QVBoxLayout()
+        right_col.addWidget(QLabel("Sélection (double-clic pour retirer):"))
+        self.list_sel = QListWidget()
+        self.list_sel.itemDoubleClicked.connect(self.remove_selected_item)
+        right_col.addWidget(self.list_sel, 1)
+
+        btn_row = QHBoxLayout()
+        self.btn_send = QPushButton("Envoyer la sélection (0)")
+        self.btn_send.clicked.connect(self.on_send)
+        self.btn_clear = QPushButton("Effacer sélection & logs")
+        self.btn_clear.clicked.connect(self.clear_selection_and_logs)
+        btn_row.addWidget(self.btn_send)
+        btn_row.addWidget(self.btn_clear)
+        right_col.addLayout(btn_row)
+
+        mid_row.addLayout(right_col, 1)
+        root.addLayout(mid_row, 1)
+
+        self.logs = QTextEdit()
+        self.logs.setReadOnly(True)
+        self.logs.setPlaceholderText("Logs webhook / réponses serveur…")
+        root.addWidget(self.logs, 1)
+
+        self.setMinimumSize(980, 560)
+
+    # --- dossier ---
+    def load_dir(self, path: str):
+        path = os.path.abspath(path)
+        pathlib.Path(path).mkdir(parents=True, exist_ok=True)
+        self.edit_dir.setText(path)
+        idx = self.fs_model.setRootPath(path)
+        proxy_idx = self.proxy.mapFromSource(idx)
+        self.view.setRootIndex(proxy_idx)
+        for col in range(1, self.fs_model.columnCount()):
+            self.view.setColumnHidden(col, True)
+
+    def change_dir(self):
+        base = self.edit_dir.text() or DEFAULT_N8N_DIR
+        chosen = QFileDialog.getExistingDirectory(self, "Choisir un dossier", base)
+        if chosen:
+            self.load_dir(chosen)
+
+    def open_dir(self):
+        folder = self.edit_dir.text().strip()
+        if not folder:
+            return
+        url = QUrl.fromLocalFile(folder)
+        QDesktopServices.openUrl(url)
+
+    # --- sélection ---
+    def update_send_button(self):
+        self.btn_send.setText(f"Envoyer la sélection ({len(self.selected_paths)})")
+
+    def add_to_selection(self, fullpath: str):
+        if fullpath in self.selected_paths:
+            return
+        self.selected_paths.add(fullpath)
+        item = QListWidgetItem(os.path.basename(fullpath))
+        item.setToolTip(fullpath)
+        item.setData(Qt.UserRole, fullpath)
+        self.list_sel.addItem(item)
+        self.update_send_button()
+
+    def remove_selected_item(self, item: QListWidgetItem):
+        full = item.data(Qt.UserRole)
+        if full in self.selected_paths:
+            self.selected_paths.remove(full)
+        row = self.list_sel.row(item)
+        self.list_sel.takeItem(row)
+        self.update_send_button()
+
+    def on_file_double_clicked(self, proxy_index: QModelIndex):
+        src_index = self.proxy.mapToSource(proxy_index)
+        fullpath = self.fs_model.filePath(src_index)
+        if not fullpath:
+            return
+        if fullpath in self.selected_paths:
+            for i in range(self.list_sel.count()):
+                it = self.list_sel.item(i)
+                if it.data(Qt.UserRole) == fullpath:
+                    self.remove_selected_item(it)
+                    break
+        else:
+            self.add_to_selection(fullpath)
+
+    # --- envoi ---
+    def on_send(self):
+        if self.worker and self.worker.isRunning():
+            return
+
+        url = (self.edit_url.text() or "").strip()
+        if not url:
+            QMessageBox.warning(self, "Manque URL", "Colle l’URL du webhook n8n.")
+            return
+
+        files = sorted(self.selected_paths)
+        if not files:
+            QMessageBox.information(
+                self,
+                "Rien à envoyer",
+                "Sélectionne au moins un fichier (double-clic).",
+            )
+            return
+
+        self.logs.append(f">>> Prépare l’envoi de {len(files)} fichier(s)…")
+        self.btn_send.setEnabled(False)
+        self.worker = MultiUploadWorker(url, files, self)
+        self.worker.sig_log.connect(self.logs.append)
+        self.worker.sig_done.connect(self.on_sent_done)
+        self.worker.start()
+
+    def on_sent_done(self, ok: bool):
+        self.btn_send.setEnabled(True)
+        self.worker = None
+        if ok:
+            QMessageBox.information(self, "OK", "Tous les envois ont réussi.")
+        else:
+            QMessageBox.warning(
+                self,
+                "Terminé avec erreurs",
+                "Au moins un fichier a échoué. Consulte les logs pour les détails.",
+            )
+
+    def clear_selection_and_logs(self):
+        self.selected_paths.clear()
+        self.list_sel.clear()
+        self.logs.clear()
+        self.update_send_button()
+
+
 # ---------------------- Onglets placeholders ----------------------
 class ComingSoonTab(QWidget):
     def __init__(self, title="À venir", parent=None):
@@ -1085,7 +1373,7 @@ class Main(QWidget):
         root = QVBoxLayout(self)
         tabs = QTabWidget()
         tabs.addTab(YoutubeTab(app_ref=QApplication.instance()), "YouTube")
-        tabs.addTab(ComingSoonTab("À venir 1"), "À venir 1")
+        tabs.addTab(N8NTab(), "N8N")
         tabs.addTab(ComingSoonTab("À venir 2"), "À venir 2")
         tabs.addTab(ComingSoonTab("À venir 3"), "À venir 3")
         tabs.addTab(ComingSoonTab("À venir 4"), "À venir 4")
