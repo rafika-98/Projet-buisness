@@ -2,6 +2,7 @@ import os, subprocess, shutil, sys, pathlib
 
 OUT_DIR = pathlib.Path(r"C:\Users\Lamine\Desktop\Projet\downloads")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+DOWNLOAD_ARCHIVE = OUT_DIR / "archive.txt"
 from dataclasses import dataclass
 from typing import Optional, List, Dict
 
@@ -425,12 +426,15 @@ class YoutubeTab(QWidget):
                 {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"},
                 {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
             ],
-            "keepvideo": True,
+            "keepvideo": False,
             "quiet": True,
             "no_warnings": True,
             "continuedl": True,
             "concurrent_fragment_downloads": 4,
             "noplaylist": False,
+            "download_archive": str(DOWNLOAD_ARCHIVE),
+            "nooverwrites": True,
+            "overwrites": False,
         }
         return opts
 
@@ -502,14 +506,52 @@ class YoutubeTab(QWidget):
         self.window().setWindowTitle(f"FlowGrab — {text}")
 
     def cleanup_residuals(self, task: Task):
-        """Supprime les fichiers WebM/M4A du même ID pour ne garder que .mp4/.mp3"""
-        if not task.video_id: return
+        """
+        Supprime tout fichier intermédiaire lié au même ID :
+          - audio/vidéo bruts (.webm, .m4a, etc.)
+          - vidéo brute .fNNN.mp4 (.f137.mp4, .f248.mp4, etc.)
+        Conserve uniquement :
+          - Titre [ID].mp4 (final)
+          - Titre [ID].mp3 (final)
+        """
+        if not task.video_id:
+            return
+
         outdir = OUT_DIR
-        if not outdir.exists(): return
-        for p in outdir.glob(f"*[{task.video_id}].*"):
-            if p.suffix.lower() not in (".mp4", ".mp3"):
-                try: p.unlink()
-                except Exception: pass
+        if not outdir.exists():
+            return
+
+        token = f"[{task.video_id}]"
+
+        for p in outdir.iterdir():
+            try:
+                if not p.is_file():
+                    continue
+                name = p.name
+                if token not in name:
+                    continue
+
+                ext = p.suffix.lower()
+
+                # Conserver systématiquement le MP3 final
+                if ext == ".mp3":
+                    continue
+
+                # Conserver uniquement le MP4 FINAL (sans suffixe .fNNN)
+                if ext == ".mp4":
+                    # ex. "Titre [ID].f137.mp4" -> supprimer
+                    stem = p.stem  # nom sans extension
+                    if ".f" in stem:
+                        p.unlink()      # mp4 intermédiaire (itag)
+                    else:
+                        continue        # mp4 final
+                    continue
+
+                # Tout le reste (m4a, webm, mkv, opus, etc.) -> supprimer
+                p.unlink()
+            except Exception:
+                # ignorer erreurs pour ne pas bloquer l'app
+                pass
 
 # ---------------------- Onglets placeholders ----------------------
 class ComingSoonTab(QWidget):
