@@ -1,4 +1,6 @@
 import os, subprocess, shutil, sys, pathlib
+import signal
+import tempfile
 
 OUT_DIR = pathlib.Path(r"C:\Users\Lamine\Desktop\Projet final\Application\downloads")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -126,6 +128,68 @@ class InspectWorker(QThread):
             self.sig_done.emit(self.url, info or {})
         except Exception as e:
             self.sig_error.emit(self.url, str(e))
+
+
+class LongProcWorker(QThread):
+    """Lance un processus long (ex: script PowerShell), stream les logs, et permet un stop propre."""
+
+    sig_line = Signal(str)     # ligne de log
+    sig_started = Signal(int)  # pid
+    sig_done = Signal(int)     # code retour
+
+    def __init__(self, args: list[str], env: dict | None = None, parent=None):
+        super().__init__(parent)
+        self.args = args
+        self.env = env
+        self.proc: subprocess.Popen | None = None
+
+    def run(self):
+        try:
+            creationflags = 0
+            if sys.platform.startswith("win"):
+                # pour pouvoir envoyer CTRL_BREAK_EVENT et tuer l'arbre si besoin
+                creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            self.proc = subprocess.Popen(
+                self.args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                shell=False,
+                env=self.env,
+                creationflags=creationflags,
+            )
+            assert self.proc.stdout is not None
+            self.sig_started.emit(self.proc.pid or 0)
+            for line in self.proc.stdout:
+                self.sig_line.emit(line.rstrip())
+            self.proc.wait()
+            self.sig_done.emit(self.proc.returncode or 0)
+        except Exception as e:
+            self.sig_line.emit(f"[ERREUR] {e}")
+            self.sig_done.emit(1)
+
+    def stop(self):
+        if not self.proc:
+            return
+        # 1) tentative d'arrêt propre
+        try:
+            if sys.platform.startswith("win"):
+                self.proc.send_signal(signal.CTRL_BREAK_EVENT)
+        except Exception:
+            pass
+        try:
+            self.proc.terminate()
+        except Exception:
+            pass
+        # 2) arrêt dur de l'arbre si nécessaire
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(self.proc.pid), "/T", "/F"],
+                capture_output=True,
+                text=True
+            )
+        except Exception:
+            pass
 
 
 # ---------------------- Thèmes ----------------------
@@ -631,6 +695,193 @@ class YoutubeTab(QWidget):
             except Exception:
                 pass
 
+
+class ServeurTab(QWidget):
+    """Onglet très simple avec deux boutons : Allumer / Éteindre.
+    Allumer => lance PowerShell avec le script (cloudflared + n8n).
+    Éteindre => arrête le process et son arbre.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.worker: LongProcWorker | None = None
+        self.ps_file: str | None = None
+        self._pid: int | None = None
+        self.build_ui()
+
+    def build_ui(self):
+        root = QVBoxLayout(self)
+
+        # Ligne boutons + statut
+        row = QHBoxLayout()
+        self.btn_on = QPushButton("Allumer")
+        self.btn_off = QPushButton("Éteindre")
+        self.btn_off.setEnabled(False)
+        self.lab_status = QLabel("Statut : inactif")
+        self.btn_on.clicked.connect(self.start)
+        self.btn_off.clicked.connect(self.stop)
+        row.addWidget(self.btn_on)
+        row.addWidget(self.btn_off)
+        row.addStretch(1)
+        row.addWidget(self.lab_status)
+        root.addLayout(row)
+
+        # Logs
+        self.logs = QTextEdit()
+        self.logs.setReadOnly(True)
+        self.logs.setPlaceholderText("Logs cloudflared / n8n…")
+        root.addWidget(self.logs)
+
+    # --- helpers UI ---
+    def log(self, s: str):
+        self.logs.append(s)
+
+    # --- start/stop ---
+    def start(self):
+        if self.worker and self.worker.isRunning():
+            QMessageBox.information(self, "Déjà en cours", "Le serveur est déjà allumé.")
+            return
+
+        # Vérifs rapides côté Python pour retour immédiat à l'utilisateur
+        pwsh = shutil.which("powershell") or shutil.which("powershell.exe")
+        if not pwsh:
+            QMessageBox.warning(self, "PowerShell introuvable", "PowerShell est requis.")
+            return
+        if not shutil.which("cloudflared"):
+            QMessageBox.warning(self, "cloudflared introuvable",
+                                "Installe-le : winget install Cloudflare.cloudflared")
+            return
+        if not shutil.which("n8n"):
+            QMessageBox.warning(self, "n8n introuvable",
+                                "Installe-le : npm i -g n8n")
+            return
+
+        # Écrit le script PowerShell fourni par l'utilisateur dans un fichier temporaire
+        ps_code = r'''
+param([int]$Port = 5678)
+
+$ErrorActionPreference = 'Stop'
+
+# --- Vérifs rapides
+if (-not (Get-Command cloudflared -ErrorAction SilentlyContinue)) {
+  Write-Error "cloudflared introuvable. Installe-le: winget install Cloudflare.cloudflared"
+  exit 1
+}
+if (-not (Get-Command n8n -ErrorAction SilentlyContinue)) {
+  Write-Error "n8n introuvable. Installe-le: npm i -g n8n"
+  exit 1
+}
+if (Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue) {
+  Write-Error "Le port $Port est déjà utilisé. Ferme l'autre instance ou choisis un autre port."
+  exit 1
+}
+
+# --- 1) Démarre cloudflared en arrière-plan et loggue sa sortie (stdout/err séparés)
+$logOut = Join-Path $env:TEMP "cloudflared_n8n_${Port}_out.log"
+$logErr = Join-Path $env:TEMP "cloudflared_n8n_${Port}_err.log"
+if (Test-Path $logOut) { Remove-Item $logOut -Force }
+if (Test-Path $logErr) { Remove-Item $logErr -Force }
+
+$cfArgs = @("tunnel","--url","http://localhost:$Port","--ha-connections","1","--protocol","quic")
+$cfProc = Start-Process (Get-Command cloudflared).Source `
+          -ArgumentList $cfArgs -NoNewWindow `
+          -RedirectStandardOutput $logOut -RedirectStandardError $logErr -PassThru
+Write-Host "cloudflared PID: $($cfProc.Id). Attente de l'URL publique…"
+
+# --- 2) Récupère l'URL publique
+$publicUrl = $null
+$regex = [regex]'https://[a-z0-9-]+\.trycloudflare\.com'
+for ($i=0; $i -lt 60; $i++) {  # ~30s max
+  $content = ""
+  if (Test-Path $logOut) { $content += (Get-Content $logOut -Raw) }
+  if (Test-Path $logErr) { $content += "`n" + (Get-Content $logErr -Raw) }
+  if ($content) {
+    $m = $regex.Match($content)
+    if ($m.Success) { $publicUrl = $m.Value; break }
+  }
+  Start-Sleep -Milliseconds 500
+}
+
+if ($publicUrl) {
+  Write-Host "URL publique: $publicUrl"
+  $env:WEBHOOK_URL         = $publicUrl
+  $env:N8N_EDITOR_BASE_URL = $publicUrl
+} else {
+  Write-Warning "Impossible de lire l'URL publique. n8n sera accessible en local uniquement."
+}
+
+# --- 3) Exporte le port (ne PAS changer N8N_ENCRYPTION_KEY si tu as déjà lancé n8n avant)
+$env:N8N_PORT = "$Port"
+
+# --- 4) Lance n8n au premier plan
+Write-Host "Démarrage n8n sur http://localhost:$Port ..."
+& (Get-Command n8n).Source
+
+# --- 5) A l'arrêt de n8n, coupe cloudflared proprement
+Write-Host "n8n arrêté. Extinction de cloudflared…"
+if ($cfProc -and -not $cfProc.HasExited) {
+  try { Stop-Process -Id $cfProc.Id -Force -ErrorAction SilentlyContinue } catch {}
+}
+Write-Host "Terminé."
+'''
+        if self.ps_file and os.path.exists(self.ps_file):
+            try:
+                os.remove(self.ps_file)
+            except Exception:
+                pass
+            self.ps_file = None
+        fd, tmp = tempfile.mkstemp(prefix="fg_srv_", suffix=".ps1")
+        os.close(fd)
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(ps_code)
+        self.ps_file = tmp
+
+        args = [
+            pwsh,
+            "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-File", tmp,
+            "-Port", "5678",  # le besoin: 2 boutons sans autre option; port fixe
+        ]
+
+        self.log(f">>> Lancement serveur (port 5678)")
+        self.lab_status.setText("Statut : démarrage…")
+        self.btn_on.setEnabled(False)
+        self.btn_off.setEnabled(True)
+
+        self.worker = LongProcWorker(args, env=os.environ.copy(), parent=self)
+        self.worker.sig_started.connect(self.on_started)
+        self.worker.sig_line.connect(self.log)
+        self.worker.sig_done.connect(self.on_done)
+        self.worker.start()
+
+    def on_started(self, pid: int):
+        self._pid = pid
+        self.lab_status.setText(f"Statut : en cours (pid {pid})")
+        self.log(f"[ps] démarré (pid {pid})")
+
+    def stop(self):
+        self.lab_status.setText("Statut : arrêt…")
+        self.log(">>> Extinction demandée…")
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+        else:
+            self.on_done(0)
+
+    def on_done(self, code: int):
+        self.log(f">>> Terminé (code={code})")
+        self.lab_status.setText("Statut : inactif")
+        self.btn_on.setEnabled(True)
+        self.btn_off.setEnabled(False)
+        self._pid = None
+        self.worker = None
+        if self.ps_file:
+            try:
+                os.remove(self.ps_file)
+            except Exception:
+                pass
+            self.ps_file = None
+
+
 # ---------------------- Onglets placeholders ----------------------
 class ComingSoonTab(QWidget):
     def __init__(self, title="À venir", parent=None):
@@ -757,7 +1008,7 @@ class Main(QWidget):
         root = QVBoxLayout(self)
         tabs = QTabWidget()
         tabs.addTab(YoutubeTab(app_ref=QApplication.instance()), "YouTube")
-        tabs.addTab(ComingSoonTab("À venir 2"), "À venir 2")
+        tabs.addTab(ServeurTab(), "Serveur")
         tabs.addTab(ComingSoonTab("À venir 3"), "À venir 3")
         tabs.addTab(ComingSoonTab("À venir 4"), "À venir 4")
         tabs.addTab(SettingsTab(), "Paramètres généraux")
