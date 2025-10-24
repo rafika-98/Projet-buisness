@@ -781,6 +781,35 @@ class N8NTab(QWidget):
         else:
             self.stop_stack()
 
+    def _find_exe(self, base_name: str, extra_candidates: list[str] | None = None) -> str | None:
+        """
+        Recherche robuste d'un exécutable :
+          - via PATH (shutil.which)
+          - sous Windows: %APPDATA%\npm\{name}.cmd/.exe
+          - chemins absolus fournis en fallback
+        """
+        # 1) via PATH
+        for n in [base_name, f"{base_name}.cmd", f"{base_name}.exe"]:
+            p = shutil.which(n)
+            if p:
+                return p
+
+        # 2) Windows: %APPDATA%\npm
+        if sys.platform.startswith("win"):
+            appdata = os.environ.get("APPDATA", "")
+            if appdata:
+                npm_bin = os.path.join(appdata, "npm")
+                for n in [base_name, f"{base_name}.cmd", f"{base_name}.exe"]:
+                    p = os.path.join(npm_bin, n)
+                    if os.path.exists(p):
+                        return p
+
+        # 3) Fallbacks absolus
+        for p in (extra_candidates or []):
+            if p and os.path.exists(p):
+                return p
+        return None
+
     # ---------- Start: Cloudflare -> n8n ----------
     def start_stack(self):
         if self.n8n_worker and self.n8n_worker.isRunning():
@@ -797,7 +826,13 @@ class N8NTab(QWidget):
         self.append_log(f">>> Démarrage stack (port {port})")
 
         if self.chk_cloudflare.isChecked():
-            cf_bin = shutil.which("cloudflared")
+            cf_bin = self._find_exe(
+                "cloudflared",
+                extra_candidates=[
+                    r"C:\\Program Files\\Cloudflare\\Cloudflared\\cloudflared.exe",
+                    r"C:\\Program Files (x86)\\Cloudflare\\Cloudflared\\cloudflared.exe",
+                ],
+            )
             if not cf_bin:
                 QMessageBox.warning(
                     self, "cloudflared introuvable",
@@ -806,8 +841,9 @@ class N8NTab(QWidget):
                 self.chk_power.setChecked(False)
                 return
 
+            self.append_log(f">>> cloudflared choisi : {cf_bin}")
             args = [cf_bin, "tunnel", "--url", f"http://localhost:{port}", "--ha-connections", "1", "--protocol", "quic"]
-            self.append_log(f">>> cloudflared: {' '.join(args)}")
+            self.append_log(f">>> cloudflared cmd : {' '.join(args)}")
             self.cf_worker = ProcTailWorker(args, env=os.environ.copy(), parent=self)
             self.cf_worker.sig_started.connect(self.on_cf_started)
             self.cf_worker.sig_line.connect(self.on_cf_line)
@@ -840,23 +876,41 @@ class N8NTab(QWidget):
             QTimer.singleShot(500, self.try_launch_n8n)
 
     def launch_n8n(self, port: str):
-        n8n_bin = shutil.which("n8n")
+        n8n_bin = self._find_exe("n8n")
         if not n8n_bin:
+            self.append_log("!!! n8n introuvable via PATH/APPDATA. PATH courant ci-dessous.")
+            self.append_log(f">>> PATH={os.environ.get('PATH','')}")
             QMessageBox.warning(self, "n8n introuvable",
-                                "Impossible de trouver 'n8n' dans le PATH. Installe-le (npm i -g n8n).")
+                                "Impossible de trouver 'n8n'. Installe-le (npm i -g n8n).")
             self.stop_stack()
             self.chk_power.setChecked(False)
             return
 
         env = os.environ.copy()
+
+        # Ajoute %APPDATA%\npm au PATH enfant si absent (cas fréquent sous Windows)
+        if sys.platform.startswith("win"):
+            appdata = env.get("APPDATA", "")
+            if appdata:
+                npm_bin = os.path.join(appdata, "npm")
+                if os.path.isdir(npm_bin) and npm_bin not in env.get("PATH", ""):
+                    env["PATH"] = npm_bin + os.pathsep + env.get("PATH", "")
+
         env["N8N_PORT"] = port
-        # Injecter URL publique si dispo
         if self.public_url:
             env["WEBHOOK_URL"] = self.public_url
             env["N8N_EDITOR_BASE_URL"] = self.public_url
 
-        self.append_log(f">>> n8n: {n8n_bin} (N8N_PORT={port})")
-        self.n8n_worker = ProcTailWorker([n8n_bin], env=env, parent=self)
+        if sys.platform.startswith("win") and n8n_bin.lower().endswith(".cmd"):
+            cmd = [os.environ.get("COMSPEC", "cmd.exe"), "/c", n8n_bin]
+        else:
+            cmd = [n8n_bin]
+
+        self.append_log(f">>> n8n choisi : {n8n_bin}")
+        self.append_log(f">>> PATH enfant : {env.get('PATH','')}")
+        self.append_log(f">>> lancement n8n (N8N_PORT={port})")
+
+        self.n8n_worker = ProcTailWorker(cmd, env=env, parent=self)
         self.n8n_worker.sig_started.connect(self.on_n8n_started)
         self.n8n_worker.sig_line.connect(lambda s: self.append_log(f"[n8n] {s}"))
         self.n8n_worker.sig_done.connect(self.on_n8n_done)
