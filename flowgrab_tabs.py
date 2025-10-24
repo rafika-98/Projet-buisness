@@ -1,6 +1,6 @@
 import os, subprocess, shutil, sys, pathlib
 
-OUT_DIR = pathlib.Path(r"C:\Users\Lamine\Desktop\Projet\downloads")
+OUT_DIR = pathlib.Path(r"C:\Users\Lamine\Desktop\Projet final\Application\downloads")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 DOWNLOAD_ARCHIVE = OUT_DIR / "archive.txt"
 from dataclasses import dataclass
