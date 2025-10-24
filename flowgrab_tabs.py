@@ -1,4 +1,5 @@
 import os, subprocess, shutil, sys, pathlib
+import signal
 
 OUT_DIR = pathlib.Path(r"C:\Users\Lamine\Desktop\Projet final\Application\downloads")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -126,6 +127,67 @@ class InspectWorker(QThread):
             self.sig_done.emit(self.url, info or {})
         except Exception as e:
             self.sig_error.emit(self.url, str(e))
+
+
+class ProcTailWorker(QThread):
+    """Lance un processus long (ex: serveur n8n), stream les logs, et permet un stop propre."""
+
+    sig_line = Signal(str)     # ligne de log
+    sig_started = Signal(int)  # pid
+    sig_done = Signal(int)     # code retour
+
+    def __init__(
+        self,
+        cmd: list[str] | str,
+        cwd: pathlib.Path | None = None,
+        env: dict | None = None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.cmd = cmd
+        self.cwd = str(cwd) if cwd else None
+        self.env = env
+        self.proc: subprocess.Popen | None = None
+
+    def run(self):
+        try:
+            creationflags = 0
+            if sys.platform.startswith("win"):
+                # pour pouvoir envoyer CTRL_BREAK_EVENT
+                creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            self.proc = subprocess.Popen(
+                self.cmd,
+                cwd=self.cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=self.env,
+                shell=False,  # on passe un binaire trouvé via shutil.which
+                creationflags=creationflags,
+            )
+            assert self.proc.stdout is not None
+            self.sig_started.emit(self.proc.pid or 0)
+            for line in self.proc.stdout:
+                self.sig_line.emit(line.rstrip())
+            self.proc.wait()
+            self.sig_done.emit(self.proc.returncode or 0)
+        except Exception as e:
+            self.sig_line.emit(f"[ERREUR] {e}")
+            self.sig_done.emit(1)
+
+    def stop(self):
+        if not self.proc:
+            return
+        try:
+            if sys.platform.startswith("win"):
+                # Tente un CTRL_BREAK pour laisser le serveur se fermer proprement
+                self.proc.send_signal(signal.CTRL_BREAK_EVENT)
+        except Exception:
+            pass
+        try:
+            self.proc.terminate()
+        except Exception:
+            pass
 
 # ---------------------- Thèmes ----------------------
 def apply_dark_theme(app: QApplication):
@@ -630,6 +692,109 @@ class YoutubeTab(QWidget):
             except Exception:
                 pass
 
+# ---------------------- Onglet n8n ----------------------
+class N8NTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.worker: ProcTailWorker | None = None
+        self._pid: int | None = None
+        self.build_ui()
+
+    def build_ui(self):
+        root = QVBoxLayout(self)
+
+        # Ligne options (Port + Ouvrir UI)
+        opts = QHBoxLayout()
+        opts.addWidget(QLabel("Port"))
+        self.edit_port = QLineEdit("5678")
+        self.edit_port.setFixedWidth(80)
+        self.btn_open_ui = QPushButton("Ouvrir l’UI")
+        self.btn_open_ui.clicked.connect(self.open_ui)
+        opts.addWidget(self.edit_port)
+        opts.addStretch(1)
+        opts.addWidget(self.btn_open_ui)
+        root.addLayout(opts)
+
+        # Boutons Start/Stop + statut
+        bar = QHBoxLayout()
+        self.btn_start = QPushButton("Démarrer n8n")
+        self.btn_stop = QPushButton("Stopper n8n")
+        self.btn_stop.setEnabled(False)
+        self.lab_status = QLabel("Statut : inactif")
+        self.btn_start.clicked.connect(self.on_start)
+        self.btn_stop.clicked.connect(self.on_stop)
+        bar.addWidget(self.btn_start)
+        bar.addWidget(self.btn_stop)
+        bar.addStretch(1)
+        bar.addWidget(self.lab_status)
+        root.addLayout(bar)
+
+        # Logs
+        self.logs = QTextEdit()
+        self.logs.setReadOnly(True)
+        self.logs.setPlaceholderText("Logs du serveur n8n…")
+        root.addWidget(self.logs)
+
+    def append_log(self, text: str):
+        self.logs.append(text)
+
+    def open_ui(self):
+        port = (self.edit_port.text() or "5678").strip()
+        url = QUrl(f"http://localhost:{port}")
+        QDesktopServices.openUrl(url)
+
+    def on_start(self):
+        if self.worker and self.worker.isRunning():
+            QMessageBox.information(self, "Déjà en cours", "n8n est déjà démarré.")
+            return
+
+        # Trouver le binaire n8n
+        n8n_bin = shutil.which("n8n")
+        if not n8n_bin:
+            QMessageBox.warning(
+                self,
+                "n8n introuvable",
+                "Impossible de trouver 'n8n' dans le PATH.\n"
+                "Installe-le globalement (ex: npm i -g n8n) ou ajoute-le au PATH.",
+            )
+            return
+
+        port = (self.edit_port.text() or "5678").strip()
+        env = os.environ.copy()
+        env["N8N_PORT"] = port
+
+        self.append_log(f">>> Lancement : {n8n_bin} (N8N_PORT={port})")
+        self.lab_status.setText("Statut : démarrage…")
+        self.btn_start.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+
+        self.worker = ProcTailWorker([n8n_bin], cwd=None, env=env, parent=self)
+        self.worker.sig_line.connect(self.append_log)
+        self.worker.sig_started.connect(self.on_started)
+        self.worker.sig_done.connect(self.on_done)
+        self.worker.start()
+
+    def on_started(self, pid: int):
+        self._pid = pid
+        self.lab_status.setText(f"Statut : en cours (pid {pid})")
+
+    def on_stop(self):
+        if self.worker and self.worker.isRunning():
+            self.append_log(">>> Arrêt en cours…")
+            self.lab_status.setText("Statut : arrêt…")
+            self.worker.stop()
+        else:
+            QMessageBox.information(self, "Info", "n8n n’est pas en cours.")
+
+    def on_done(self, code: int):
+        self.append_log(f">>> n8n terminé (code={code})")
+        self.lab_status.setText("Statut : inactif")
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self._pid = None
+        self.worker = None
+
+
 # ---------------------- Onglets placeholders ----------------------
 class ComingSoonTab(QWidget):
     def __init__(self, title="À venir", parent=None):
@@ -756,7 +921,7 @@ class Main(QWidget):
         root = QVBoxLayout(self)
         tabs = QTabWidget()
         tabs.addTab(YoutubeTab(app_ref=QApplication.instance()), "YouTube")
-        tabs.addTab(ComingSoonTab("À venir 1"), "À venir 1")
+        tabs.addTab(N8NTab(), "n8n")
         tabs.addTab(ComingSoonTab("À venir 2"), "À venir 2")
         tabs.addTab(ComingSoonTab("À venir 3"), "À venir 3")
         tabs.addTab(ComingSoonTab("À venir 4"), "À venir 4")
