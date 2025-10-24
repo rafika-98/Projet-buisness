@@ -1050,13 +1050,33 @@ class ExtFilterProxy(QSortFilterProxyModel):
     def __init__(self, allowed_exts: tuple[str, ...], parent=None):
         super().__init__(parent)
         self.allowed_exts = tuple(ext.lower() for ext in allowed_exts)
+        self._root_path: str | None = None
+
+    def set_root_path(self, path: str):
+        """Force l'affichage de la branche menant au dossier racine choisi."""
+        self._root_path = os.path.abspath(path)
+        self.invalidateFilter()
+
+    def _is_ancestor_of_root(self, path: str) -> bool:
+        if not self._root_path:
+            return False
+        root = self._root_path
+        # Autorise la racine elle-même et tous ses ancêtres (C:\, C:\Users, …)
+        if path == root:
+            return True
+        if root.startswith(path.rstrip(os.sep) + os.sep):
+            return True
+        return False
 
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
         idx = self.sourceModel().index(source_row, 0, source_parent)
         if not idx.isValid():
             return False
+
+        path = self.sourceModel().filePath(idx)
         if self.sourceModel().isDir(idx):
-            return False
+            return self._is_ancestor_of_root(os.path.abspath(path))
+
         name = self.sourceModel().fileName(idx).lower()
         return name.endswith(self.allowed_exts)
 
@@ -1147,6 +1167,7 @@ class N8NTab(QWidget):
         path = os.path.abspath(path)
         pathlib.Path(path).mkdir(parents=True, exist_ok=True)
         self.edit_dir.setText(path)
+        self.proxy.set_root_path(path)
         idx = self.fs_model.setRootPath(path)
         proxy_idx = self.proxy.mapFromSource(idx)
         self.view.setRootIndex(proxy_idx)
