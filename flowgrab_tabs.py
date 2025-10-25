@@ -95,6 +95,7 @@ from PySide6.QtWidgets import (
     QProgressBar, QMessageBox, QGroupBox, QTabWidget, QTableWidget,
     QTableWidgetItem,
     QAbstractItemView,
+    QSpinBox,
 )
 from PySide6.QtWidgets import QTextEdit
 
