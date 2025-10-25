@@ -2,6 +2,7 @@ import os, subprocess, shutil, sys, pathlib, mimetypes
 import signal
 import tempfile
 import threading
+import re
 
 OUT_DIR = pathlib.Path(r"C:\Users\Lamine\Desktop\Projet final\Application\downloads")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -10,6 +11,35 @@ AUDIOS_DIR = OUT_DIR / "Audios"
 VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
 AUDIOS_DIR.mkdir(parents=True, exist_ok=True)
 DOWNLOAD_ARCHIVE = OUT_DIR / "archive.txt"
+
+# PATCH START: config persistante
+CONFIG_PATH = OUT_DIR / "flowgrab_config.json"
+
+
+def load_config() -> dict:
+    try:
+        import json
+        if CONFIG_PATH.exists():
+            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {
+        "webhook_path": "/webhook/Audio",  # chemin fixe
+        "webhook_base": "",                # ex: https://xxxx.trycloudflare.com
+        "webhook_full": "",                # base + path
+        "last_updated": ""
+    }
+
+
+def save_config(cfg: dict) -> None:
+    try:
+        import json, datetime
+        cfg = dict(cfg)
+        cfg["last_updated"] = datetime.datetime.utcnow().isoformat() + "Z"
+        CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+# PATCH END
 from dataclasses import dataclass
 from typing import Optional, List, Dict
 
@@ -45,11 +75,20 @@ def _send_windows_notification(message: str) -> None:
     if not sys.platform.startswith("win"):
         return
     try:
+        from win10toast import ToastNotifier  # optionnel
+        ToastNotifier().show_toast("FlowGrab", message, duration=5, threaded=True)
+        return
+    except Exception:
+        pass
+    try:
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        subprocess.Popen(
-            ["cmd", "/c", "msg", "*", message],
-            creationflags=creationflags,
-        )
+        subprocess.Popen([
+            "cmd",
+            "/c",
+            "msg",
+            "*",
+            message,
+        ], creationflags=creationflags)
     except Exception:
         pass
 
@@ -75,10 +114,15 @@ def start_notification_server(parent_widget=None) -> None:
         _notification_server_started = True
         return
 
+    from flask import request  # import ici pour éviter conflit avec l'import conditionnel global
     flask_app = Flask("flowgrab-notify")
+    TOKEN = os.environ.get("FG_NOTIFY_TOKEN", "change_me")
 
     @flask_app.get("/notify-done")
     def notify_done():  # pragma: no cover - exécuté via requête HTTP
+        if request.args.get("token") != TOKEN:
+            return {"status": "forbidden"}, 403
+
         def show_message_box():
             parent = _notification_parent_widget
             if parent is not None and hasattr(parent, "isVisible") and not parent.isVisible():
@@ -93,7 +137,7 @@ def start_notification_server(parent_widget=None) -> None:
 
     def run_flask():  # pragma: no cover - serveur en arrière-plan
         try:
-            flask_app.run(host="0.0.0.0", port=5050, debug=False, use_reloader=False)
+            flask_app.run(host="127.0.0.1", port=5050, debug=False, use_reloader=False)
         except Exception as exc:
             def warn_error():
                 parent = _notification_parent_widget
@@ -121,6 +165,8 @@ class Task:
     eta: Optional[int] = None
     video_id: Optional[str] = None  # pour nettoyage
     selected_fmt: Optional[str] = None
+    final_audio_path: Optional[str] = None
+    final_video_path: Optional[str] = None
 
 # ---------------------- Worker de téléchargement ----------------------
 class DownloadWorker(QThread):
@@ -159,8 +205,11 @@ class DownloadWorker(QThread):
         try:
             with YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(self.task.url, download=True)
-                fn = ydl.prepare_filename(info)
-            self.sig_done.emit(True, fn, info or {})
+                if info and info.get("_type") == "playlist":
+                    fn = ""
+                else:
+                    fn = ydl.prepare_filename(info)
+            self.sig_done.emit(True, fn or "Téléchargement terminé", info or {})
         except Exception as e:
             self.sig_done.emit(False, str(e), {})
 
@@ -261,29 +310,36 @@ class LongProcWorker(QThread):
     def stop(self):
         if not self.proc:
             return
-        # 1) tentative d'arrêt propre
+        # PATCH START: stop propre + wait court
         try:
             if sys.platform.startswith("win"):
                 self.proc.send_signal(signal.CTRL_BREAK_EVENT)
+                try:
+                    self.proc.wait(timeout=3)
+                except Exception:
+                    pass
         except Exception:
             pass
         try:
             self.proc.terminate()
         except Exception:
             pass
-        # 2) arrêt dur de l'arbre si nécessaire
         try:
-            subprocess.run(
-                ["taskkill", "/PID", str(self.proc.pid), "/T", "/F"],
-                capture_output=True,
-                text=True
-            )
+            subprocess.run([
+                "taskkill",
+                "/PID",
+                str(self.proc.pid),
+                "/T",
+                "/F",
+            ], capture_output=True, text=True)
         except Exception:
             pass
+        # PATCH END
 
 
 # ---------------------- Thèmes ----------------------
 def apply_dark_theme(app: QApplication):
+    app.setStyle("Fusion")
     palette = QPalette()
     bg = QColor(30, 30, 30)
     base = QColor(40, 40, 40)
@@ -308,6 +364,7 @@ def apply_dark_theme(app: QApplication):
     app.setPalette(palette)
 
 def apply_light_theme(app: QApplication):
+    app.setStyle("Fusion")
     app.setPalette(QApplication.style().standardPalette())
 
 # ---------------------- Utilitaires affichage ----------------------
@@ -377,13 +434,14 @@ def _unique_path(dst: pathlib.Path) -> pathlib.Path:
         i += 1
 
 
-def move_final_outputs(task: Task):
+def move_final_outputs(task: Task) -> dict:
     """
     Déplace les fichiers finaux (.mp4, .mp3) du sous-dossier 'Titre [ID]'
     vers 'Videos' et 'Audios' (à plat). Gère les collisions de noms.
     """
+    moved = {"audio": None, "video": None}
     if not task.video_id or not task.filename:
-        return
+        return moved
 
     try:
         src_dir = pathlib.Path(task.filename).parent
@@ -394,23 +452,27 @@ def move_final_outputs(task: Task):
                 continue
             ext = p.suffix.lower()
 
-            # .mp4 final: on exclut les fichiers intermédiaires de type ".fNNN.mp4"
             if ext == ".mp4" and ".f" not in p.stem:
-                dst_dir = VIDEOS_DIR
-            # .mp3 final
+                dst = _unique_path(VIDEOS_DIR / p.name)
+                try:
+                    p.replace(dst)
+                except Exception:
+                    shutil.move(str(p), str(dst))
+                moved["video"] = str(dst)
             elif ext == ".mp3":
-                dst_dir = AUDIOS_DIR
-            else:
-                continue
-
-            dst = _unique_path(dst_dir / p.name)
-            try:
-                p.replace(dst)  # atomique si même volume
-            except Exception:
-                shutil.move(str(p), str(dst))
+                dst = _unique_path(AUDIOS_DIR / p.name)
+                try:
+                    p.replace(dst)
+                except Exception:
+                    shutil.move(str(p), str(dst))
+                moved["audio"] = str(dst)
     except Exception:
-        # on ne casse pas le flux si un move échoue
         pass
+    if moved["audio"]:
+        task.final_audio_path = moved["audio"]
+    if moved["video"]:
+        task.final_video_path = moved["video"]
+    return moved
 
 
 def delete_dir_if_empty(path: pathlib.Path):
@@ -428,6 +490,8 @@ def delete_dir_if_empty(path: pathlib.Path):
 # ---------------------- Onglet YouTube ----------------------
 
 class YoutubeTab(QWidget):
+    sig_request_transcription = Signal(list)
+
     def __init__(self, app_ref, parent=None):
         super().__init__(parent)
         self.app_ref = app_ref
@@ -441,6 +505,25 @@ class YoutubeTab(QWidget):
         self.inspect_debounce.setInterval(250)  # 250ms de debounce
         self.inspect_debounce.timeout.connect(self._inspect_current_after_debounce)
         self.build_ui()
+
+    # PATCH START: helper curseur attente + usage
+    def _cursor_wait(self, on: bool):
+        if on and QApplication.overrideCursor() is None:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+        elif not on:
+            try:
+                QApplication.restoreOverrideCursor()
+            except Exception:
+                pass
+
+    def _open_dir(self, path: pathlib.Path):
+        try:
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        except AttributeError:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        except Exception as e:
+            QMessageBox.warning(self, "Erreur", f"Impossible d’ouvrir le dossier : {e}")
+    # PATCH END
 
     def build_ui(self):
         root = QVBoxLayout(self)
@@ -457,11 +540,15 @@ class YoutubeTab(QWidget):
         btn_file  = QPushButton("Depuis .txt");    btn_file.clicked.connect(self.add_from_file)
         btn_clear_urls = QPushButton("Vider la liste"); btn_clear_urls.clicked.connect(self.clear_url_list)
         btn_open  = QPushButton("Ouvrir le dossier");   btn_open.clicked.connect(self.open_output_dir)
+        btn_open_v = QPushButton("Ouvrir Vidéos"); btn_open_v.clicked.connect(lambda: self._open_dir(VIDEOS_DIR))
+        btn_open_a = QPushButton("Ouvrir Audios"); btn_open_a.clicked.connect(lambda: self._open_dir(AUDIOS_DIR))
         add_line.addWidget(self.edit_url)
         add_line.addWidget(btn_add)
         add_line.addWidget(btn_file)
         add_line.addWidget(btn_clear_urls)
         add_line.addWidget(btn_open)
+        add_line.addWidget(btn_open_v)
+        add_line.addWidget(btn_open_a)
         urls_layout.addLayout(add_line)
 
         self.list = QListWidget()
@@ -511,12 +598,7 @@ class YoutubeTab(QWidget):
 
     def open_output_dir(self):
         path = OUT_DIR
-        try:
-            os.startfile(str(path))  # type: ignore[attr-defined]
-        except AttributeError:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
-        except Exception as e:
-            QMessageBox.warning(self, "Erreur", f"Impossible d’ouvrir le dossier : {e}")
+        self._open_dir(path)
 
     def clear_url_list(self):
         self.queue.clear()
@@ -591,8 +673,7 @@ class YoutubeTab(QWidget):
         # UI: état "Analyse…"
         self.tbl.setRowCount(0)
         self.statusBar("Analyse des formats…")
-        if QApplication.overrideCursor() is None:
-            QApplication.setOverrideCursor(Qt.WaitCursor)
+        self._cursor_wait(True)
         self.btn_start.setEnabled(False)
 
         # numéro de séquence pour ignorer les réponses tardives
@@ -657,11 +738,11 @@ class YoutubeTab(QWidget):
                 self.tbl.setItem(row, col, QTableWidgetItem(val))
 
         self.tbl.resizeColumnsToContents()
-        self.statusBar("Formats prêts")
-        try:
-            QApplication.restoreOverrideCursor()
-        except Exception:
-            pass
+        title = self.last_inspect_info.get("title") or "—"
+        duration = self.last_inspect_info.get("duration") or 0
+        dur_txt = human_eta(int(duration)) if duration else "—"
+        self.statusBar(f"Formats prêts — {title} ({dur_txt})")
+        self._cursor_wait(False)
         self.btn_start.setEnabled(True)
         self.inspect_worker = None
 
@@ -670,13 +751,13 @@ class YoutubeTab(QWidget):
         # ignorer si une requête plus récente a été lancée
         if seq != self.inspect_seq:
             return
-        try:
-            QApplication.restoreOverrideCursor()
-        except Exception:
-            pass
+        self._cursor_wait(False)
         self.btn_start.setEnabled(True)
         self.statusBar("Échec de l’analyse")
         QMessageBox.warning(self, "Erreur", f"Impossible d’inspecter : {msg}")
+        if "429" in msg or "Too Many Requests" in msg:
+            QMessageBox.warning(self, "Limite atteinte",
+                                "YouTube a limité l’inspection (429). Réessaie dans ~1 minute.")
         self.inspect_worker = None
 
     def on_format_double_click(self, it: QTableWidgetItem):
@@ -742,7 +823,7 @@ class YoutubeTab(QWidget):
             "no_warnings": True,
             "continuedl": True,
             "concurrent_fragment_downloads": 4,
-            "noplaylist": False,
+            "noplaylist": True,
             "download_archive": str(DOWNLOAD_ARCHIVE),
             "nooverwrites": True,
             "overwrites": False,
@@ -757,6 +838,16 @@ class YoutubeTab(QWidget):
         if self.current_worker and self.current_worker.isRunning():
             QMessageBox.information(self, "Déjà en cours", "Un téléchargement est déjà en cours.")
             return
+
+        # PATCH START: vérif FFmpeg
+        if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+            QMessageBox.warning(
+                self,
+                "FFmpeg manquant",
+                "Installe FFmpeg avant de télécharger (ex: winget install Gyan.FFmpeg).",
+            )
+            return
+        # PATCH END
 
         next_task = None
         for i in range(self.list.count()):
@@ -804,7 +895,7 @@ class YoutubeTab(QWidget):
             item.setText(f"[Terminé] {task.url}")
             self.statusBar(f"Terminé : {msg}")
             task.video_id = (info or {}).get("id")
-            move_final_outputs(task)
+            moved = move_final_outputs(task)
             self.cleanup_residuals(task)
             try:
                 if task.filename:
@@ -812,6 +903,17 @@ class YoutubeTab(QWidget):
                     delete_dir_if_empty(subdir)
             except Exception:
                 pass
+
+            audio_path = moved.get("audio") or task.final_audio_path
+            if audio_path:
+                reply = QMessageBox.question(
+                    self,
+                    "Transcription",
+                    "Voulez-vous transcrire l’audio téléchargé ?",
+                    QMessageBox.Yes | QMessageBox.No,
+                )
+                if reply == QMessageBox.Yes:
+                    self.sig_request_transcription.emit([audio_path])
         else:
             task.status = "Erreur"
             item.setText(f"[Erreur] {task.url}")
@@ -819,8 +921,8 @@ class YoutubeTab(QWidget):
         self.bar.setValue(0)
         self.current_worker = None
         self.btn_start.setEnabled(True)
-        QThread.msleep(200)
-        self.start_queue()
+        QTimer.singleShot(200, self.start_queue)
+        return
 
     def statusBar(self, text: str):
         self.window().setWindowTitle(f"FlowGrab — {text}")
@@ -865,6 +967,8 @@ class ServeurTab(QWidget):
     Éteindre => arrête le process et son arbre.
     """
 
+    sig_public_url = Signal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.worker: LongProcWorker | None = None
@@ -898,6 +1002,9 @@ class ServeurTab(QWidget):
     # --- helpers UI ---
     def log(self, s: str):
         self.logs.append(s)
+        m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", s)
+        if m:
+            self.sig_public_url.emit(m.group(0))
 
     # --- start/stop ---
     def start(self):
@@ -1045,7 +1152,7 @@ Write-Host "Terminé."
             self.ps_file = None
 
 
-# ---------------------- Onglet N8N ----------------------
+# ---------------------- Onglet Transcription ----------------------
 class MultiUploadWorker(QThread):
     sig_log = Signal(str)
     sig_done = Signal(bool)
@@ -1070,6 +1177,7 @@ class MultiUploadWorker(QThread):
 
         all_ok = True
         self.sig_log.emit(f">>> Envoi vers {self.url} — {len(self.files)} fichier(s)")
+        session = requests.Session()
         for path in self.files:
             if not os.path.exists(path):
                 self.sig_log.emit(f"[SKIP] Introuvable : {path}")
@@ -1086,7 +1194,7 @@ class MultiUploadWorker(QThread):
             try:
                 with open(path, "rb") as handle:
                     files = {"data": (basename, handle, mime)}
-                    resp = requests.post(self.url, files=files, timeout=180)
+                    resp = session.post(self.url, files=files, timeout=(10, 600))
                 self.sig_log.emit(f"HTTP {resp.status_code}")
                 body = resp.text or ""
                 if len(body) > 2000:
@@ -1106,29 +1214,33 @@ class MultiUploadWorker(QThread):
                 all_ok = False
                 self.sig_log.emit(f"[ERREUR réseau] {exc}")
 
+        session.close()
         self.sig_log.emit(">>> Terminé.")
         self.sig_done.emit(all_ok)
 
 
-class N8NTab(QWidget):
+class TranscriptionTab(QWidget):
+    sig_url_changed = Signal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.selected_paths: set[str] = set()
         self.worker: MultiUploadWorker | None = None
         self.last_dir: str | None = None
+        self._updating_url = False
+        self._webhook_path = "/webhook/Audio"
         self.build_ui()
         self.update_send_button()
 
-    # --- UI construction ---
+    # PATCH START: rename N8NTab -> TranscriptionTab (+ libellés)
     def build_ui(self):
         root = QVBoxLayout(self)
 
         url_row = QHBoxLayout()
-        url_row.addWidget(QLabel("Webhook URL:"))
+        url_row.addWidget(QLabel("URL de transcription (n8n):"))
         self.edit_url = QLineEdit()
-        self.edit_url.setPlaceholderText(
-            "https://…trycloudflare.com/webhook-test/XXXX ou …/webhook/XXXX"
-        )
+        self.edit_url.setPlaceholderText("https://…trycloudflare.com/webhook/Audio")
+        self.edit_url.textChanged.connect(self.on_url_changed)
         url_row.addWidget(self.edit_url, 1)
         root.addLayout(url_row)
 
@@ -1155,6 +1267,7 @@ class N8NTab(QWidget):
         root.addWidget(self.logs, 1)
 
         self.setMinimumSize(720, 480)
+    # PATCH END
 
     # --- sélection ---
     def update_send_button(self):
@@ -1197,6 +1310,10 @@ class N8NTab(QWidget):
 
     # --- envoi ---
     def on_send(self):
+        if self.worker is not None:
+            QMessageBox.information(self, "Envoi en cours", "Un upload est déjà en cours.")
+            return
+
         url = (self.edit_url.text() or "").strip()
         if not url:
             QMessageBox.warning(self, "Manque URL", "Colle l’URL du webhook n8n.")
@@ -1240,6 +1357,43 @@ class N8NTab(QWidget):
         self.list_sel.clear()
         self.logs.clear()
         self.update_send_button()
+
+    # PATCH START: init + setters + envoi direct
+    def init_from_config(self, cfg: dict):
+        path = cfg.get("webhook_path") or "/webhook/Audio"
+        full = cfg.get("webhook_full") or ""
+        base = cfg.get("webhook_base") or ""
+        if not full and base:
+            full = base.rstrip("/") + path
+        if full:
+            self._set_url_text(full)
+        self._webhook_path = path
+
+    def set_webhook_full(self, full: str):
+        cur = (self.edit_url.text() or "").strip()
+        if not cur or "trycloudflare.com" in cur:
+            self._set_url_text(full)
+
+    def send_files_immediately(self, paths: list[str]):
+        for p in paths:
+            self.add_to_selection(p)
+        if self.worker is None:
+            self.on_send()
+        else:
+            self.logs.append("Upload déjà en cours, les fichiers sont ajoutés à la file.")
+    # PATCH END
+
+    def _set_url_text(self, text: str):
+        self._updating_url = True
+        try:
+            self.edit_url.setText(text)
+        finally:
+            self._updating_url = False
+
+    def on_url_changed(self, text: str):
+        if self._updating_url:
+            return
+        self.sig_url_changed.emit(text)
 # ---------------------- Onglets placeholders ----------------------
 class ComingSoonTab(QWidget):
     def __init__(self, title="À venir", parent=None):
@@ -1364,16 +1518,67 @@ class Main(QWidget):
         super().__init__()
         self.setWindowTitle("FlowGrab — Video Downloader (yt-dlp)")
         root = QVBoxLayout(self)
+        # PATCH START: tabs wiring + config + signaux
+        self.youtube_tab = YoutubeTab(app_ref=QApplication.instance())
+        self.transcription_tab = TranscriptionTab()
+        self.serveur_tab = ServeurTab()
+
         tabs = QTabWidget()
-        tabs.addTab(YoutubeTab(app_ref=QApplication.instance()), "YouTube")
-        tabs.addTab(N8NTab(), "N8N")
+        tabs.addTab(self.youtube_tab, "YouTube")
+        tabs.addTab(self.transcription_tab, "Transcription")
         tabs.addTab(ComingSoonTab("À venir 2"), "À venir 2")
         tabs.addTab(ComingSoonTab("À venir 3"), "À venir 3")
         tabs.addTab(ComingSoonTab("À venir 4"), "À venir 4")
         tabs.addTab(SettingsTab(), "Paramètres généraux")
-        tabs.addTab(ServeurTab(), "Serveur")
+        tabs.addTab(self.serveur_tab, "Serveur")
+        self.tabs = tabs
         root.addWidget(tabs)
+
+        # Config JSON
+        self.app_config = load_config()
+        self.transcription_tab.init_from_config(self.app_config)
+
+        # Signaux inter-onglets
+        self.serveur_tab.sig_public_url.connect(self.on_cloudflare_public_url)       # base
+        self.youtube_tab.sig_request_transcription.connect(self.on_transcription_request)
+        self.transcription_tab.sig_url_changed.connect(self.on_transcription_url_changed)
+        # PATCH END
+
         start_notification_server(self)
+
+    # PATCH START: slots Main pour webhook et transcription
+    def on_cloudflare_public_url(self, base: str):
+        path = self.app_config.get("webhook_path") or "/webhook/Audio"
+        if not path.startswith("/"):
+            path = "/" + path
+        full = base.rstrip("/") + path
+        self.app_config.update({"webhook_base": base, "webhook_full": full, "webhook_path": path})
+        save_config(self.app_config)
+        self.transcription_tab.set_webhook_full(full)
+
+    def on_transcription_request(self, file_paths: list[str]):
+        self.tabs.setCurrentWidget(self.transcription_tab)
+        self.transcription_tab.send_files_immediately(file_paths)
+
+    def on_transcription_url_changed(self, text: str):
+        path = getattr(self.transcription_tab, "_webhook_path", "/webhook/Audio") or "/webhook/Audio"
+        text = (text or "").strip()
+        if path and not path.startswith("/"):
+            path = "/" + path
+        base = ""
+        if text and path and path in text:
+            idx = text.rfind(path)
+            if idx >= 0:
+                base = text[:idx]
+        if not base:
+            base = text.rstrip("/")
+        self.app_config.update({
+            "webhook_base": base.rstrip("/"),
+            "webhook_full": text,
+            "webhook_path": path,
+        })
+        save_config(self.app_config)
+    # PATCH END
 
 # ---------------------- main ----------------------
 if __name__ == "__main__":
