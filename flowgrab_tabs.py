@@ -573,10 +573,24 @@ class LongProcWorker(QThread):
         # PATCH END
 
 
+def _apply_qdarktheme(app: QApplication, theme: str) -> bool:
+    if not HAS_QDT:
+        return False
+    # Compatibilité avec qdarktheme>=2 (setup_theme) et <2 (load_stylesheet).
+    setup = getattr(qdarktheme, "setup_theme", None)
+    if callable(setup):
+        setup(theme)
+        return True
+    loader = getattr(qdarktheme, "load_stylesheet", None)
+    if callable(loader):
+        app.setStyleSheet(loader(theme))
+        return True
+    return False
+
+
 # ---------------------- Thèmes ----------------------
 def apply_dark_theme(app: QApplication):
-    if HAS_QDT:
-        qdarktheme.setup_theme("dark")
+    if _apply_qdarktheme(app, "dark"):
         return
     app.setStyle("Fusion")
     palette = QPalette()
@@ -604,8 +618,7 @@ def apply_dark_theme(app: QApplication):
 
 
 def apply_light_theme(app: QApplication):
-    if HAS_QDT:
-        qdarktheme.setup_theme("light")
+    if _apply_qdarktheme(app, "light"):
         return
     app.setStyle("Fusion")
     app.setPalette(QApplication.style().standardPalette())
