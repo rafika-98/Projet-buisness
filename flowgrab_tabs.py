@@ -5,6 +5,8 @@ import threading
 import asyncio
 import secrets
 import re
+import time
+import random
 
 OUT_DIR = pathlib.Path(r"C:\Users\Lamine\Desktop\Projet final\Application\downloads")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -14,15 +16,32 @@ VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
 AUDIOS_DIR.mkdir(parents=True, exist_ok=True)
 DOWNLOAD_ARCHIVE = OUT_DIR / "archive.txt"
 
-from typing import Optional, List, Dict, Any, Tuple, TYPE_CHECKING
+from typing import Optional, List, Dict, Any, Tuple, TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:  # pragma: no cover - typing uniquement
     from telegram.ext import Application
+
+import telegram as tg  # pour la version
 
 YOUTUBE_REGEX = re.compile(
     r"(https?://(?:www\.)?(?:youtube\.com/watch\?\S*?v=[^\s&]+|youtu\.be/[^\s/?#]+)[^\s]*)",
     re.IGNORECASE,
 )
+
+
+def _ptb_major_minor() -> tuple[int, int]:
+    try:
+        parts = tg.__version__.split(".")[:2]
+        return int(parts[0]), int(parts[1])
+    except Exception:
+        return 20, 0
+
+
+def _backoff_sleep(attempt: int, base: float = 1.5, jitter: bool = True) -> None:
+    delay = base ** attempt
+    if jitter:
+        delay += random.uniform(0, 0.5)
+    time.sleep(delay)
 
 
 def normalize_yt(u: str) -> str:
@@ -50,17 +69,36 @@ def normalize_yt(u: str) -> str:
 def extract_basic_info(url: str) -> dict:
     """Récupère les métadonnées d'une vidéo sans lancer de téléchargement."""
     u = normalize_yt(url)
-    ydl_opts = {
+    cfg = load_config()
+    ydl_opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
         "retries": 2,
         "socket_timeout": 15,
+        "http_headers": {"User-Agent": cfg.get("user_agent") or ""},
     }
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(u, download=False)
-    if info and info.get("entries"):
-        info = info["entries"][0]
-    return info or {}
+    cookies = (cfg.get("cookies_path") or "").strip()
+    if cookies:
+        ydl_opts["cookiefile"] = cookies
+
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(u, download=False)
+            if info and info.get("entries"):
+                info = info["entries"][0]
+            return info or {}
+        except Exception as exc:  # pragma: no cover - dépend du réseau
+            last_exc = exc
+            msg = str(exc)
+            if "429" in msg or "Too Many Requests" in msg:
+                _backoff_sleep(attempt)
+                continue
+            break
+    if last_exc:
+        raise last_exc
+    return {}
 
 # PATCH START: config persistante
 CONFIG_PATH = OUT_DIR / "flowgrab_config.json"
@@ -73,6 +111,8 @@ DEFAULT_CONFIG = {
     "telegram_token": "",
     "telegram_mode": "auto",
     "telegram_port": 8081,
+    "cookies_path": "",
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 }
 
 
@@ -91,6 +131,8 @@ def _ensure_config_defaults(data: Optional[dict]) -> dict:
         cfg["telegram_port"] = int(cfg.get("telegram_port") or DEFAULT_CONFIG["telegram_port"])
     except Exception:
         cfg["telegram_port"] = DEFAULT_CONFIG["telegram_port"]
+    cfg["cookies_path"] = (cfg.get("cookies_path") or "").strip()
+    cfg["user_agent"] = (cfg.get("user_agent") or DEFAULT_CONFIG["user_agent"]).strip()
     return cfg
 
 
@@ -125,7 +167,7 @@ from PySide6.QtCore import (
     QUrl,
     QTimer,
 )
-from PySide6.QtGui import QAction, QPalette, QColor, QDesktopServices
+from PySide6.QtGui import QAction, QPalette, QColor, QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton,
     QListWidget, QListWidgetItem, QFileDialog, QLabel, QComboBox,
@@ -140,6 +182,13 @@ try:
     from flask import Flask
 except ImportError:  # pragma: no cover - dépend de l'environnement
     Flask = None  # type: ignore[assignment]
+
+try:  # thème optionnel moderne
+    import qdarktheme
+
+    HAS_QDT = True
+except Exception:  # pragma: no cover - dépend des packages installés
+    HAS_QDT = False
 
 
 _notification_server_started = False
@@ -282,12 +331,39 @@ class DownloadWorker(QThread):
         opts = dict(self.ydl_opts)
         opts["progress_hooks"] = [hook]
 
+        cfg = load_config()
+        user_agent = (cfg.get("user_agent") or "").strip()
+        headers: dict[str, str] = {}
+        if user_agent:
+            headers = dict(opts.get("http_headers") or {})
+            headers["User-Agent"] = user_agent
+            opts["http_headers"] = headers
+        cookies = (cfg.get("cookies_path") or "").strip()
+        if cookies:
+            opts["cookiefile"] = cookies
+
         try:
             url = normalize_yt(self.task.url)
             retcode = 0
-            with YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                retcode = getattr(ydl, "_download_retcode", 0) or 0
+            info: dict[str, Any] = {}
+            last_exc: Exception | None = None
+            for attempt in range(3):
+                try:
+                    with YoutubeDL(opts) as ydl:
+                        info = ydl.extract_info(url, download=True)
+                        retcode = getattr(ydl, "_download_retcode", 0) or 0
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    msg = str(exc)
+                    if "429" in msg or "Too Many Requests" in msg:
+                        self.sig_status.emit("yt-dlp : HTTP 429, nouvelle tentative…")
+                        _backoff_sleep(attempt)
+                        continue
+                    raise
+            if last_exc:
+                raise last_exc
 
             fn = captured["fn"]
             if not fn and info:
@@ -451,6 +527,9 @@ class LongProcWorker(QThread):
 
 # ---------------------- Thèmes ----------------------
 def apply_dark_theme(app: QApplication):
+    if HAS_QDT:
+        qdarktheme.setup_theme("dark")
+        return
     app.setStyle("Fusion")
     palette = QPalette()
     bg = QColor(30, 30, 30)
@@ -475,7 +554,11 @@ def apply_dark_theme(app: QApplication):
     palette.setColor(QPalette.Disabled, QPalette.ButtonText, disabled)
     app.setPalette(palette)
 
+
 def apply_light_theme(app: QApplication):
+    if HAS_QDT:
+        qdarktheme.setup_theme("light")
+        return
     app.setStyle("Fusion")
     app.setPalette(QApplication.style().standardPalette())
 
@@ -838,6 +921,8 @@ class TelegramWorker(QThread):
                 self.sig_info.emit("URL webhook absente, bascule en mode polling.")
                 mode = "polling"
             self.effective_mode = mode
+            major, minor = _ptb_major_minor()
+            self.sig_info.emit(f"python-telegram-bot v{major}.{minor}")
 
             if mode == "polling":
                 self._loop.run_until_complete(self._serve_polling())
@@ -847,11 +932,6 @@ class TelegramWorker(QThread):
         except Exception as exc:
             self.sig_info.emit(f"Erreur bot Telegram : {exc}")
         finally:
-            try:
-                if self._loop:
-                    self._loop.run_until_complete(self._shutdown())
-            except Exception:
-                pass
             if self._loop:
                 try:
                     self._loop.close()
@@ -861,6 +941,7 @@ class TelegramWorker(QThread):
             self._stop_evt = None
             self.app = None
             self._pending_choices.clear()
+            self.sig_info.emit("Bot Telegram arrêté.")
 
     async def _build_app(self):
         try:
@@ -889,14 +970,30 @@ class TelegramWorker(QThread):
             await app.bot.delete_webhook(drop_pending_updates=True)
         except Exception:
             pass
-        updater = getattr(app, "updater", None)
-        if not updater:
-            self.sig_info.emit("Impossible de démarrer le polling : updater indisponible.")
+        try:
+            await app.start_polling(drop_pending_updates=False)
+        except Exception as exc:
+            self.sig_info.emit(f"start_polling a échoué : {exc}")
+            try:
+                await app.stop()
+            except Exception:
+                pass
+            try:
+                await app.shutdown()
+            except Exception:
+                pass
             return
-        await updater.start_polling(drop_pending_updates=False)
         self.sig_info.emit("Bot Telegram démarré en mode polling.")
         if self._stop_evt:
             await self._stop_evt.wait()
+        try:
+            await app.stop()
+        except Exception:
+            pass
+        try:
+            await app.shutdown()
+        except Exception:
+            pass
 
     async def _serve_webhook(self, base: str, port: int):
         self.sig_info.emit("Bot Telegram en initialisation (webhook)…")
@@ -925,24 +1022,20 @@ class TelegramWorker(QThread):
             )
         except Exception as exc:
             self.sig_info.emit(f"Impossible de démarrer le webhook : {exc}")
+            try:
+                await app.stop()
+            except Exception:
+                pass
+            try:
+                await app.shutdown()
+            except Exception:
+                pass
             return
 
         self.sig_info.emit(f"Webhook : {webhook_url} (port {port})")
         self.sig_info.emit("Bot Telegram démarré en mode webhook.")
         if self._stop_evt:
             await self._stop_evt.wait()
-
-    async def _shutdown(self):
-        app = self.app
-        self.app = None
-        if not app:
-            self.sig_info.emit("Bot Telegram arrêté.")
-            return
-        try:
-            if getattr(app, "updater", None) and app.updater.running:
-                await app.updater.stop()
-        except Exception:
-            pass
         try:
             await app.stop_webhook()
         except Exception:
@@ -955,13 +1048,23 @@ class TelegramWorker(QThread):
             await app.shutdown()
         except Exception:
             pass
-        self._pending_choices.clear()
-        self.sig_info.emit("Bot Telegram arrêté.")
 
     def stop(self):
         if self._loop and self._stop_evt:
             self._loop.call_soon_threadsafe(self._stop_evt.set)
 # ---------------------- Utilitaires de fichiers ----------------------
+_RESERVED = '<>:"/\\|?*'
+
+
+def sanitize_filename(name: str) -> str:
+    """Nettoie un nom de fichier pour le rendre compatible multiplateforme."""
+    safe = "".join("_" if ch in _RESERVED else ch for ch in name)
+    safe = re.sub(r"\s+", " ", safe).strip()
+    if len(safe) > 150:
+        safe = safe[:150].rstrip()
+    return safe or "file"
+
+
 def _unique_path(dst: pathlib.Path) -> pathlib.Path:
     """
     Retourne un chemin libre en ajoutant -1, -2, ... si 'dst' existe déjà.
@@ -975,6 +1078,58 @@ def _unique_path(dst: pathlib.Path) -> pathlib.Path:
         if not cand.exists():
             return cand
         i += 1
+
+
+def ensure_audio(task: Task) -> Optional[str]:
+    """Garantit la présence d'un MP3 exploitable pour la transcription."""
+
+    if task.final_audio_path and os.path.exists(task.final_audio_path):
+        return task.final_audio_path
+    if not task.final_video_path or not os.path.exists(task.final_video_path):
+        return None
+    if not shutil.which("ffmpeg"):
+        return None
+
+    src = pathlib.Path(task.final_video_path)
+    base = src.stem
+    safe_base = sanitize_filename(base)
+    dst = _unique_path(AUDIOS_DIR / f"{safe_base}.mp3")
+
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(src),
+                "-vn",
+                "-acodec",
+                "libmp3lame",
+                "-b:a",
+                "192k",
+                str(dst),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode == 0 and dst.exists():
+            task.final_audio_path = str(dst)
+            return task.final_audio_path
+    except Exception:
+        pass
+    return None
+
+
+def themed_icon(*names: str) -> QIcon:
+    for name in names:
+        icon = QIcon.fromTheme(name)
+        if not icon.isNull():
+            return icon
+    return QIcon()
+
+
+def _is_merge_in_progress(repo: pathlib.Path) -> bool:
+    return (repo / ".git" / "MERGE_HEAD").exists()
 
 
 def find_existing_outputs(video_id: str) -> dict:
@@ -1035,27 +1190,46 @@ def move_final_outputs(task: Task) -> dict:
             if not p.is_file():
                 continue
             ext = p.suffix.lower()
+            if ext not in (".mp4", ".mp3", ".m4a", ".wav", ".ogg", ".flac", ".aac", ".mkv", ".webm"):
+                continue
 
-            if ext == ".mp4" and ".f" not in p.stem:
-                dst = _unique_path(VIDEOS_DIR / p.name)
-                try:
-                    p.replace(dst)
-                except Exception:
-                    shutil.move(str(p), str(dst))
+            stem = p.stem
+            token_segment = ""
+            if "[" in stem and "]" in stem:
+                start = stem.rfind("[")
+                end = stem.rfind("]")
+                if start >= 0 and end > start:
+                    token_segment = stem[start : end + 1]
+
+            base_dir = AUDIOS_DIR
+            if ext == ".mp4" and ".f" not in stem:
+                base_dir = VIDEOS_DIR
+            elif ext in (".mkv", ".webm"):
+                base_dir = VIDEOS_DIR
+
+            prefix = stem
+            if token_segment:
+                prefix = stem.replace(token_segment, "").strip()
+            safe_prefix = sanitize_filename(prefix)
+            if token_segment:
+                safe_stem = (safe_prefix + (" " if safe_prefix else "") + token_segment).strip()
+            else:
+                safe_stem = safe_prefix
+            safe_name = f"{safe_stem}{ext}"
+            dst = _unique_path(base_dir / safe_name)
+            try:
+                p.replace(dst)
+            except Exception:
+                shutil.move(str(p), str(dst))
+
+            if base_dir == VIDEOS_DIR:
                 moved["video"] = str(dst)
-            elif ext in (".mp3", ".m4a", ".wav", ".ogg", ".flac"):
-                dst = _unique_path(AUDIOS_DIR / p.name)
-                try:
-                    p.replace(dst)
-                except Exception:
-                    shutil.move(str(p), str(dst))
+                task.final_video_path = str(dst)
+            else:
                 moved["audio"] = str(dst)
+                task.final_audio_path = str(dst)
     except Exception:
         pass
-    if moved["audio"]:
-        task.final_audio_path = moved["audio"]
-    if moved["video"]:
-        task.final_video_path = moved["video"]
     return moved
 
 
@@ -1080,6 +1254,7 @@ class YoutubeTab(QWidget):
 
     def __init__(self, app_ref, parent=None):
         super().__init__(parent)
+        self.setAcceptDrops(True)
         self.app_ref = app_ref
         self.queue: List[Task] = []
         self.current_worker: Optional[DownloadWorker] = None
@@ -1113,23 +1288,56 @@ class YoutubeTab(QWidget):
 
     def build_ui(self):
         root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(8)
 
         # ----- URLs + Inspecteur -----
         urls_box = QGroupBox("URLs")
         urls_layout = QVBoxLayout(urls_box)
+        urls_layout.setContentsMargins(12, 12, 12, 12)
+        urls_layout.setSpacing(8)
 
         add_line = QHBoxLayout()
+        add_line.setSpacing(8)
         self.edit_url = QLineEdit()
         self.edit_url.setPlaceholderText("Colle une URL YouTube/playlist et presse Entrée pour l’ajouter")
         self.edit_url.returnPressed.connect(self.add_url)
-        btn_add   = QPushButton("Ajouter");        btn_add.clicked.connect(self.add_url)
-        btn_file  = QPushButton("Depuis .txt");    btn_file.clicked.connect(self.add_from_file)
-        btn_clear_urls = QPushButton("Vider la liste"); btn_clear_urls.clicked.connect(self.clear_url_list)
-        btn_open  = QPushButton("Ouvrir le dossier");   btn_open.clicked.connect(self.open_output_dir)
-        btn_open_v = QPushButton("Ouvrir Vidéos"); btn_open_v.clicked.connect(lambda: self._open_dir(VIDEOS_DIR))
-        btn_open_a = QPushButton("Ouvrir Audios"); btn_open_a.clicked.connect(lambda: self._open_dir(AUDIOS_DIR))
-        add_line.addWidget(self.edit_url)
+        btn_add = QPushButton("Ajouter")
+        icon_add = themed_icon("list-add", "document-new")
+        if not icon_add.isNull():
+            btn_add.setIcon(icon_add)
+        btn_add.clicked.connect(self.add_url)
+        btn_paste = QPushButton("Coller URL")
+        icon_paste = themed_icon("edit-paste")
+        if not icon_paste.isNull():
+            btn_paste.setIcon(icon_paste)
+        btn_paste.clicked.connect(self.paste_clipboard)
+        btn_file = QPushButton("Depuis .txt")
+        icon_file = themed_icon("document-open", "text-x-generic")
+        if not icon_file.isNull():
+            btn_file.setIcon(icon_file)
+        btn_file.clicked.connect(self.add_from_file)
+        btn_clear_urls = QPushButton("Vider la liste")
+        icon_clear = themed_icon("edit-clear", "user-trash")
+        if not icon_clear.isNull():
+            btn_clear_urls.setIcon(icon_clear)
+        btn_clear_urls.clicked.connect(self.clear_url_list)
+        btn_open = QPushButton("Ouvrir le dossier")
+        icon_open = themed_icon("folder-open")
+        if not icon_open.isNull():
+            btn_open.setIcon(icon_open)
+        btn_open.clicked.connect(self.open_output_dir)
+        btn_open_v = QPushButton("Ouvrir Vidéos")
+        if not icon_open.isNull():
+            btn_open_v.setIcon(icon_open)
+        btn_open_v.clicked.connect(lambda: self._open_dir(VIDEOS_DIR))
+        btn_open_a = QPushButton("Ouvrir Audios")
+        if not icon_open.isNull():
+            btn_open_a.setIcon(icon_open)
+        btn_open_a.clicked.connect(lambda: self._open_dir(AUDIOS_DIR))
+        add_line.addWidget(self.edit_url, 1)
         add_line.addWidget(btn_add)
+        add_line.addWidget(btn_paste)
         add_line.addWidget(btn_file)
         add_line.addWidget(btn_clear_urls)
         add_line.addWidget(btn_open)
@@ -1139,17 +1347,28 @@ class YoutubeTab(QWidget):
 
         self.list = QListWidget()
         self.list.setContextMenuPolicy(Qt.ActionsContextMenu)
-        act_del = QAction("Supprimer la sélection", self); act_del.triggered.connect(self.delete_selected)
+        act_del = QAction("Supprimer la sélection", self)
+        act_del.triggered.connect(self.delete_selected)
         self.list.addAction(act_del)
         self.list.currentItemChanged.connect(self.on_current_item_changed)
         urls_layout.addWidget(self.list)
 
         # Tableau formats
         self.tbl = QTableWidget(0, 10)
-        self.tbl.setHorizontalHeaderLabels([
-            "✔","ID video","Résolution","FPS","Ext/VC","Poids vidéo",
-            "ID audio","Audio","Poids audio","Total estimé"
-        ])
+        self.tbl.setHorizontalHeaderLabels(
+            [
+                "✔",
+                "ID video",
+                "Résolution",
+                "FPS",
+                "Ext/VC",
+                "Poids vidéo",
+                "ID audio",
+                "Audio",
+                "Poids audio",
+                "Total estimé",
+            ]
+        )
         self.tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tbl.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -1159,25 +1378,39 @@ class YoutubeTab(QWidget):
 
         # ----- Contrôles -----
         ctrl = QHBoxLayout()
-        self.btn_start = QPushButton("Démarrer"); self.btn_start.clicked.connect(self.start_queue)
-        self.btn_stop  = QPushButton("Stop"); self.btn_stop.clicked.connect(self.stop_current)
-        ctrl.addWidget(self.btn_start); ctrl.addWidget(self.btn_stop)
+        ctrl.setSpacing(8)
+        self.btn_start = QPushButton("Démarrer")
+        icon_start = themed_icon("media-playback-start", "system-run")
+        if not icon_start.isNull():
+            self.btn_start.setIcon(icon_start)
+        self.btn_start.clicked.connect(self.start_queue)
+        self.btn_stop = QPushButton("Stop")
+        icon_stop = themed_icon("media-playback-stop", "process-stop")
+        if not icon_stop.isNull():
+            self.btn_stop.setIcon(icon_stop)
+        self.btn_stop.clicked.connect(self.stop_current)
+        ctrl.addWidget(self.btn_start)
+        ctrl.addWidget(self.btn_stop)
+        ctrl.addStretch(1)
         urls_layout.addLayout(ctrl)
         root.addWidget(urls_box)
 
         # ----- Statuts -----
         stat_line = QHBoxLayout()
-        self.lab_name  = QLabel("Fichier : —")
+        stat_line.setSpacing(8)
+        self.lab_name = QLabel("Fichier : —")
         self.lab_speed = QLabel("Vitesse : —")
-        self.lab_size  = QLabel("Taille : —")
-        self.lab_eta   = QLabel("ETA : —")
+        self.lab_size = QLabel("Taille : —")
+        self.lab_eta = QLabel("ETA : —")
         stat_line.addWidget(self.lab_name, 3)
         stat_line.addWidget(self.lab_speed, 1)
         stat_line.addWidget(self.lab_size, 1)
         stat_line.addWidget(self.lab_eta, 1)
         root.addLayout(stat_line)
 
-        self.bar = QProgressBar(); self.bar.setRange(0, 100); self.bar.setValue(0)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 100)
+        self.bar.setValue(0)
         root.addWidget(self.bar)
 
         self.setMinimumWidth(1080)
@@ -1213,6 +1446,18 @@ class YoutubeTab(QWidget):
         self.inspect_task_async(item)
         self.edit_url.clear()
 
+    def paste_clipboard(self):
+        cb = QApplication.clipboard()
+        if not cb:
+            return
+        text = (cb.text() or "").strip()
+        if not text:
+            return
+        match = YOUTUBE_REGEX.search(text)
+        if match:
+            self.edit_url.setText(match.group(1))
+            self.add_url()
+
     def add_from_file(self):
         p, _ = QFileDialog.getOpenFileName(self, "Fichier .txt", "", "Text (*.txt)")
         if not p: return
@@ -1233,6 +1478,37 @@ class YoutubeTab(QWidget):
             item = new_items[0]
             self.list.setCurrentItem(item)
             self.inspect_task_async(item)
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls() or e.mimeData().hasText():
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        urls: list[str] = []
+        if e.mimeData().hasUrls():
+            for url in e.mimeData().urls():
+                path = url.toLocalFile() or url.toString()
+                if not path:
+                    continue
+                if path.lower().endswith(".txt"):
+                    try:
+                        for line in pathlib.Path(path).read_text(encoding="utf-8").splitlines():
+                            if line.strip():
+                                urls.append(line.strip())
+                    except Exception:
+                        pass
+                else:
+                    urls.append(path)
+        if e.mimeData().hasText():
+            urls.append(e.mimeData().text())
+        for raw in urls:
+            if not raw:
+                continue
+            match = YOUTUBE_REGEX.search(raw.strip())
+            if match:
+                self.edit_url.setText(match.group(1))
+                self.add_url()
+        e.acceptProposedAction()
 
     def delete_selected(self):
         for it in self.list.selectedItems():
@@ -1491,6 +1767,10 @@ class YoutubeTab(QWidget):
                 pass
 
             audio_path = moved.get("audio") or task.final_audio_path
+            if not audio_path:
+                audio_path = ensure_audio(task)
+                if audio_path:
+                    self.statusBar("Audio généré depuis la vidéo pour transcription")
             if task.source == "telegram" and task.chat_id and audio_path:
                 self.sig_audio_completed.emit(task.chat_id, audio_path)
             elif audio_path:
@@ -1818,6 +2098,7 @@ class TranscriptionTab(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setAcceptDrops(True)
         self.selected_paths: set[str] = set()
         self.worker: MultiUploadWorker | None = None
         self.last_dir: str | None = None
@@ -1829,8 +2110,11 @@ class TranscriptionTab(QWidget):
     # PATCH START: rename N8NTab -> TranscriptionTab (+ libellés)
     def build_ui(self):
         root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(8)
 
         url_row = QHBoxLayout()
+        url_row.setSpacing(8)
         url_row.addWidget(QLabel("URL de transcription (n8n):"))
         self.edit_url = QLineEdit()
         self.edit_url.setPlaceholderText("https://…trycloudflare.com/webhook/Audio")
@@ -1839,11 +2123,21 @@ class TranscriptionTab(QWidget):
         root.addLayout(url_row)
 
         actions_row = QHBoxLayout()
+        actions_row.setSpacing(8)
         self.btn_add = QPushButton("Ajouter fichier(s)…")
+        icon_add = themed_icon("list-add", "document-open")
+        if not icon_add.isNull():
+            self.btn_add.setIcon(icon_add)
         self.btn_add.clicked.connect(self.on_add_files)
         self.btn_send = QPushButton()
+        icon_send = themed_icon("mail-send", "document-send")
+        if not icon_send.isNull():
+            self.btn_send.setIcon(icon_send)
         self.btn_send.clicked.connect(self.on_send)
         self.btn_clear = QPushButton("Vider la liste")
+        icon_clear = themed_icon("edit-clear", "user-trash")
+        if not icon_clear.isNull():
+            self.btn_clear.setIcon(icon_clear)
         self.btn_clear.clicked.connect(self.clear_selection_and_logs)
         actions_row.addWidget(self.btn_add)
         actions_row.addWidget(self.btn_send)
@@ -1887,6 +2181,22 @@ class TranscriptionTab(QWidget):
         row = self.list_sel.row(item)
         self.list_sel.takeItem(row)
         self.update_send_button()
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        if not e.mimeData().hasUrls():
+            return
+        exts = {".mp3", ".m4a", ".wav", ".aac", ".ogg", ".flac", ".mp4", ".mkv", ".webm"}
+        for url in e.mimeData().urls():
+            path = url.toLocalFile()
+            if path and os.path.isfile(path):
+                if os.path.splitext(path)[1].lower() in exts:
+                    self.add_to_selection(path)
+        self.update_send_button()
+        e.acceptProposedAction()
 
     def on_add_files(self):
         start_dir = self.last_dir or str(pathlib.Path.home())
@@ -1933,6 +2243,10 @@ class TranscriptionTab(QWidget):
         self.worker.sig_log.connect(self.logs.append)
         self.worker.sig_done.connect(self.on_sent_done)
         self.worker.start()
+        token = os.environ.get("FG_NOTIFY_TOKEN", "change_me")
+        self.logs.append("Exemple n8n → App : GET http://127.0.0.1:5050/notify-done?token=<FG_NOTIFY_TOKEN>")
+        if token == "change_me":
+            self.logs.append("Définis FG_NOTIFY_TOKEN dans tes variables d’environnement pour sécuriser la notification locale.")
 
     def on_sent_done(self, ok: bool):
         self.worker = None
@@ -2014,8 +2328,11 @@ class SettingsTab(QWidget):
 
     def build_ui(self):
         root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(8)
 
         theme_line = QHBoxLayout()
+        theme_line.setSpacing(8)
         theme_label = QLabel("Thème")
         self.cmb_theme = QComboBox()
         self.cmb_theme.addItems(["Clair", "Sombre"])
@@ -2028,8 +2345,11 @@ class SettingsTab(QWidget):
         # Section Telegram
         grp_tg = QGroupBox("Telegram")
         tg_layout = QVBoxLayout(grp_tg)
+        tg_layout.setContentsMargins(12, 12, 12, 12)
+        tg_layout.setSpacing(8)
 
         row_token = QHBoxLayout()
+        row_token.setSpacing(8)
         row_token.addWidget(QLabel("Token"))
         self.ed_token = QLineEdit()
         self.ed_token.setPlaceholderText("123456:ABC-DEF…")
@@ -2037,6 +2357,7 @@ class SettingsTab(QWidget):
         tg_layout.addLayout(row_token)
 
         row_mode = QHBoxLayout()
+        row_mode.setSpacing(8)
         row_mode.addWidget(QLabel("Mode"))
         self.cmb_mode = QComboBox()
         self.cmb_mode.addItems(["Auto", "Polling", "Webhook"])
@@ -2049,9 +2370,38 @@ class SettingsTab(QWidget):
         row_mode.addStretch(1)
         tg_layout.addLayout(row_mode)
 
+        row_cookies = QHBoxLayout()
+        row_cookies.setSpacing(8)
+        row_cookies.addWidget(QLabel("Cookies.txt"))
+        self.ed_cookies = QLineEdit()
+        self.ed_cookies.setPlaceholderText("Chemin vers cookies.txt (optionnel)")
+        row_cookies.addWidget(self.ed_cookies, 1)
+        self.btn_cookies = QPushButton("Parcourir…")
+        icon_file = themed_icon("document-open", "folder-open")
+        if not icon_file.isNull():
+            self.btn_cookies.setIcon(icon_file)
+        self.btn_cookies.clicked.connect(self.on_pick_cookies)
+        row_cookies.addWidget(self.btn_cookies)
+        tg_layout.addLayout(row_cookies)
+
+        row_user_agent = QHBoxLayout()
+        row_user_agent.setSpacing(8)
+        row_user_agent.addWidget(QLabel("User-Agent"))
+        self.ed_user_agent = QLineEdit()
+        self.ed_user_agent.setPlaceholderText("Mozilla/5.0 …")
+        row_user_agent.addWidget(self.ed_user_agent, 1)
+        tg_layout.addLayout(row_user_agent)
+
         row_ctrl = QHBoxLayout()
+        row_ctrl.setSpacing(8)
         self.btn_tg_start = QPushButton("Démarrer bot")
+        icon_start = themed_icon("media-playback-start", "system-run")
+        if not icon_start.isNull():
+            self.btn_tg_start.setIcon(icon_start)
         self.btn_tg_stop = QPushButton("Arrêter bot")
+        icon_stop = themed_icon("media-playback-stop", "process-stop")
+        if not icon_stop.isNull():
+            self.btn_tg_stop.setIcon(icon_stop)
         self.btn_tg_stop.setEnabled(False)
         self.lab_tg = QLabel("Bot : inactif")
         row_ctrl.addWidget(self.btn_tg_start)
@@ -2064,13 +2414,39 @@ class SettingsTab(QWidget):
 
         # Ligne boutons maintenance
         line = QHBoxLayout()
+        line.setSpacing(8)
         self.btn_update = QPushButton("Mettre à jour l’app (git pull origin main)")
+        icon_update = themed_icon("view-refresh", "system-software-update")
+        if not icon_update.isNull():
+            self.btn_update.setIcon(icon_update)
         self.btn_restart = QPushButton("Redémarrer l’app")
+        icon_restart = themed_icon("system-reboot", "application-exit")
+        if not icon_restart.isNull():
+            self.btn_restart.setIcon(icon_restart)
         self.btn_update.clicked.connect(self.on_update_clicked)
         self.btn_restart.clicked.connect(self.on_restart_clicked)
         line.addWidget(self.btn_update)
         line.addWidget(self.btn_restart)
         root.addLayout(line)
+
+        self.lab_git_hint = QLabel("")
+        self.lab_git_hint.setWordWrap(True)
+        root.addWidget(self.lab_git_hint)
+
+        git_grp = QGroupBox("Git – Outils de merge")
+        git_layout = QHBoxLayout(git_grp)
+        git_layout.setContentsMargins(12, 12, 12, 12)
+        git_layout.setSpacing(8)
+        self.btn_git_continue = QPushButton("Continuer le merge (guidé)")
+        self.btn_git_continue.clicked.connect(self.on_git_continue_merge)
+        self.btn_git_abort = QPushButton("Abort merge (git merge --abort)")
+        self.btn_git_abort.clicked.connect(self.on_git_merge_abort)
+        self.btn_git_stash_pull = QPushButton("Stash & Pull (rebase)")
+        self.btn_git_stash_pull.clicked.connect(self.on_git_stash_pull)
+        git_layout.addWidget(self.btn_git_continue)
+        git_layout.addWidget(self.btn_git_abort)
+        git_layout.addWidget(self.btn_git_stash_pull)
+        root.addWidget(git_grp)
 
         # Zone de logs
         self.logs = QTextEdit()
@@ -2083,10 +2459,14 @@ class SettingsTab(QWidget):
         info.setWordWrap(True)
         root.addWidget(info)
 
-        # Connexions config Telegram
+        # Connexions config Telegram / yt-dlp
         self.ed_token.textChanged.connect(lambda s: self._save_cfg("telegram_token", s.strip()))
         self.cmb_mode.currentTextChanged.connect(lambda t: self._save_cfg("telegram_mode", (t or "auto").lower()))
         self.spin_port.valueChanged.connect(lambda v: self._save_cfg("telegram_port", int(v)))
+        self.ed_cookies.textChanged.connect(lambda s: self._save_cfg("cookies_path", s.strip()))
+        self.ed_user_agent.textChanged.connect(lambda s: self._save_cfg("user_agent", s.strip()))
+
+        self.refresh_merge_state()
 
     def init_from_config(self, cfg: dict):
         self._loading_cfg = True
@@ -2103,9 +2483,14 @@ class SettingsTab(QWidget):
                 self.spin_port.setValue(int(port))
             except Exception:
                 self.spin_port.setValue(DEFAULT_CONFIG["telegram_port"])
+            cookies = cfg.get("cookies_path") or ""
+            self.ed_cookies.setText(cookies)
+            user_agent = cfg.get("user_agent") or DEFAULT_CONFIG["user_agent"]
+            self.ed_user_agent.setText(user_agent)
             self.set_telegram_idle()
         finally:
             self._loading_cfg = False
+        self.refresh_merge_state()
 
     def _save_cfg(self, key: str, value: Any):
         if self._loading_cfg or not self.app_ref:
@@ -2120,6 +2505,10 @@ class SettingsTab(QWidget):
                 cfg[key] = int(value)
             except Exception:
                 cfg[key] = DEFAULT_CONFIG["telegram_port"]
+        elif key == "cookies_path":
+            cfg[key] = value or ""
+        elif key == "user_agent":
+            cfg[key] = value or DEFAULT_CONFIG["user_agent"]
         else:
             cfg[key] = value
         save_config(cfg)
@@ -2137,6 +2526,100 @@ class SettingsTab(QWidget):
     def append_telegram_info(self, text: str):
         self.append_log(f"[Telegram] {text}")
 
+    def on_pick_cookies(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Cookies.txt", "", "Text (*.txt);;Tous les fichiers (*.*)")
+        if path:
+            self.ed_cookies.setText(path)
+
+    def refresh_merge_state(self):
+        repo = self.find_git_root()
+        in_merge = bool(repo and _is_merge_in_progress(repo))
+        if in_merge:
+            self.lab_git_hint.setText("Merge en cours détecté. Utilise les outils ci-dessous pour le résoudre.")
+            self.btn_update.setEnabled(False)
+        else:
+            self.lab_git_hint.setText("")
+            if not (self.worker and self.worker.isRunning()):
+                self.btn_update.setEnabled(True)
+
+    def _launch_git(self, args: list[str], cwd: pathlib.Path, next_cb: Callable[[int], None] | None = None) -> bool:
+        if self.worker and self.worker.isRunning():
+            QMessageBox.information(self, "Git", "Une commande git est déjà en cours.")
+            return False
+        git = shutil.which("git")
+        if not git:
+            QMessageBox.warning(self, "Git", "Git introuvable dans le PATH.")
+            return False
+        self.append_log(f">>> git {' '.join(args)}")
+        self.btn_update.setEnabled(False)
+        worker = CommandWorker([git, *args], cwd=cwd)
+        self.worker = worker
+        worker.sig_line.connect(self.append_log)
+
+        def done(code: int):
+            self.append_log(f">>> (exit={code})")
+            self.worker = None
+            if next_cb:
+                next_cb(code)
+            else:
+                self.refresh_merge_state()
+
+        worker.sig_done.connect(done)
+        worker.start()
+        return True
+
+    def _run_git_sequence(self, commands: list[list[str]], cwd: pathlib.Path):
+        if not commands:
+            self.refresh_merge_state()
+            return
+
+        first, *rest = commands
+
+        def after(code: int):
+            if code == 0 and rest:
+                self._run_git_sequence(rest, cwd)
+            else:
+                self.refresh_merge_state()
+
+        if not self._launch_git(first, cwd, next_cb=after):
+            self.refresh_merge_state()
+
+    def on_git_merge_abort(self):
+        repo = self.find_git_root()
+        if not repo:
+            self.append_log("Pas de repo.")
+            return
+        if not _is_merge_in_progress(repo):
+            QMessageBox.information(self, "Git", "Aucun merge en cours.")
+            return
+        self.append_log(f">>> cwd: {repo}")
+        self._launch_git(["merge", "--abort"], repo)
+
+    def on_git_continue_merge(self):
+        repo = self.find_git_root()
+        if not repo:
+            self.append_log("Pas de repo.")
+            return
+        if not _is_merge_in_progress(repo):
+            QMessageBox.information(self, "Git", "Aucun merge en cours.")
+            return
+        self.append_log(f">>> cwd: {repo}")
+        if self._launch_git(["status"], repo):
+            self.append_log("Conseil: résous les conflits, puis `git add -A` et `git commit`.\nUtilise 'Mettre à jour' ensuite.")
+
+    def on_git_stash_pull(self):
+        repo = self.find_git_root()
+        if not repo:
+            self.append_log("Pas de repo.")
+            return
+        self.append_log(f">>> cwd: {repo}")
+        cmds = [
+            ["stash", "push", "-u", "-m", "flowgrab-auto"],
+            ["pull", "--rebase", "origin", "main"],
+            ["stash", "pop"],
+        ]
+        self._run_git_sequence(cmds, repo)
+
     # ---------- Actions ----------
     def on_theme_change(self, _idx: int):
         app = QApplication.instance()
@@ -2148,32 +2631,37 @@ class SettingsTab(QWidget):
             apply_light_theme(app)
 
     def on_update_clicked(self):
-        git_exe = shutil.which("git")
-        if not git_exe:
-            QMessageBox.warning(self, "Git introuvable", "Impossible de trouver 'git' dans le PATH.")
-            return
-
         repo_root = self.find_git_root()
         if not repo_root:
             QMessageBox.warning(self, "Hors dépôt Git", "Aucun dossier '.git' trouvé en remontant depuis ce projet.")
             return
+        if _is_merge_in_progress(repo_root):
+            QMessageBox.information(self, "Git", "Un merge est en cours. Utilise les outils dédiés avant de lancer git pull.")
+            self.refresh_merge_state()
+            return
 
         self.append_log(f">>> cwd: {repo_root}")
-        self.append_log(">>> git pull origin main")
-        self.btn_update.setEnabled(False)
 
-        self.worker = CommandWorker([git_exe, "pull", "origin", "main"], cwd=repo_root)
-        self.worker.sig_line.connect(self.append_log)
-        self.worker.sig_done.connect(self.on_update_done)
-        self.worker.start()
+        def after(code: int):
+            self.on_update_done(code)
+            self.refresh_merge_state()
+
+        if not self._launch_git(["pull", "origin", "main"], repo_root, next_cb=after):
+            self.refresh_merge_state()
 
     def on_update_done(self, code: int):
-        self.append_log(f">>> Terminé (code retour = {code})")
-        self.btn_update.setEnabled(True)
         if code != 0:
-            QMessageBox.warning(self, "Échec mise à jour", "La commande git s'est terminée avec une erreur.\nConsulte les logs.")
+            QMessageBox.warning(
+                self,
+                "Échec mise à jour",
+                "La commande git s'est terminée avec une erreur.\nConsulte les logs.",
+            )
         else:
-            QMessageBox.information(self, "Mise à jour OK", "Pull terminé. Clique sur 'Redémarrer l’app' pour prendre en compte les changements.")
+            QMessageBox.information(
+                self,
+                "Mise à jour OK",
+                "Pull terminé. Clique sur 'Redémarrer l’app' pour prendre en compte les changements.",
+            )
 
     def on_restart_clicked(self):
         # Relance le même script avec les mêmes arguments
