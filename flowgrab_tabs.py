@@ -2,7 +2,10 @@ import os, subprocess, shutil, sys, pathlib, mimetypes
 import signal
 import tempfile
 import threading
+import asyncio
+import secrets
 import re
+from urllib.parse import quote, unquote
 
 OUT_DIR = pathlib.Path(r"C:\Users\Lamine\Desktop\Projet final\Application\downloads")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -12,31 +15,65 @@ VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
 AUDIOS_DIR.mkdir(parents=True, exist_ok=True)
 DOWNLOAD_ARCHIVE = OUT_DIR / "archive.txt"
 
+from typing import Optional, List, Dict, Any, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover - typing uniquement
+    from telegram.ext import Application
+
+YOUTUBE_REGEX = re.compile(
+    r"(https?://(?:www\.)?(?:youtube\.com/watch\?\S*?v=[^\s&]+|youtu\.be/[^\s/?#]+)[^\s]*)",
+    re.IGNORECASE,
+)
+
 # PATCH START: config persistante
 CONFIG_PATH = OUT_DIR / "flowgrab_config.json"
+
+DEFAULT_CONFIG = {
+    "webhook_path": "/webhook/Audio",
+    "webhook_base": "",
+    "webhook_full": "",
+    "last_updated": "",
+    "telegram_token": "",
+    "telegram_mode": "auto",
+    "telegram_port": 8081,
+}
+
+
+def _ensure_config_defaults(data: Optional[dict]) -> dict:
+    cfg = dict(DEFAULT_CONFIG)
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if value is None:
+                continue
+            cfg[key] = value
+    mode = (cfg.get("telegram_mode") or "auto").lower()
+    if mode not in ("auto", "polling", "webhook"):
+        mode = "auto"
+    cfg["telegram_mode"] = mode
+    try:
+        cfg["telegram_port"] = int(cfg.get("telegram_port") or DEFAULT_CONFIG["telegram_port"])
+    except Exception:
+        cfg["telegram_port"] = DEFAULT_CONFIG["telegram_port"]
+    return cfg
 
 
 def load_config() -> dict:
     try:
         import json
         if CONFIG_PATH.exists():
-            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            return _ensure_config_defaults(data)
     except Exception:
         pass
-    return {
-        "webhook_path": "/webhook/Audio",  # chemin fixe
-        "webhook_base": "",                # ex: https://xxxx.trycloudflare.com
-        "webhook_full": "",                # base + path
-        "last_updated": ""
-    }
+    return _ensure_config_defaults(None)
 
 
 def save_config(cfg: dict) -> None:
     try:
         import json, datetime
-        cfg = dict(cfg)
-        cfg["last_updated"] = datetime.datetime.utcnow().isoformat() + "Z"
-        CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        merged = _ensure_config_defaults(cfg)
+        merged["last_updated"] = datetime.datetime.utcnow().isoformat() + "Z"
+        CONFIG_PATH.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
         pass
 # PATCH END
@@ -167,6 +204,9 @@ class Task:
     selected_fmt: Optional[str] = None
     final_audio_path: Optional[str] = None
     final_video_path: Optional[str] = None
+    # Telegram
+    source: str = "ui"                 # "ui" | "telegram"
+    chat_id: Optional[int] = None
 
 # ---------------------- Worker de téléchargement ----------------------
 class DownloadWorker(QThread):
@@ -418,6 +458,373 @@ def estimate_size(stream: dict, duration: Optional[float]) -> Optional[float]:
         return float(tbr) * 1000.0 / 8.0 * float(duration)
     return None
 
+# ---------------------- Telegram worker ----------------------
+class TelegramWorker(QThread):
+    sig_download_requested = Signal(str, str, int, str)  # url, fmt, chat_id, title
+    sig_ask_transcription = Signal(int, str)              # chat_id, audio_path
+    sig_info = Signal(str)
+
+    def __init__(self, app_config: dict, parent=None):
+        super().__init__(parent)
+        self.app_config = app_config
+        self._application: "Application | None" = None
+        self._pending_choices: Dict[str, Dict[str, Any]] = {}
+        self.effective_mode = self._resolve_mode()
+
+    # ---- helpers ----
+    def _resolve_mode(self) -> str:
+        mode = (self.app_config.get("telegram_mode") or "auto").lower()
+        base = (self.app_config.get("webhook_base") or "").strip()
+        if mode == "auto":
+            return "webhook" if base else "polling"
+        if mode == "webhook" and not base:
+            return "polling"
+        if mode not in ("polling", "webhook"):
+            return "polling"
+        return mode
+
+    def _submit_async(self, coro: Any) -> None:
+        app = self._application
+        if not app:
+            return
+        try:
+            app.create_task(coro)
+        except Exception:
+            loop = getattr(app, "loop", None)
+            if loop:
+                asyncio.run_coroutine_threadsafe(coro, loop)
+
+    def send_message(self, chat_id: int, text: str, reply_markup: Any = None) -> None:
+        app = self._application
+        if not app:
+            return
+
+        async def _send():
+            try:
+                await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+            except Exception as exc:
+                self.sig_info.emit(f"Envoi message Telegram impossible : {exc}")
+
+        self._submit_async(_send())
+
+    def ask_transcription(self, chat_id: int, audio_path: str) -> None:
+        self.sig_ask_transcription.emit(chat_id, audio_path)
+        app = self._application
+        if not app:
+            return
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+        try:
+            rel = os.path.relpath(audio_path, OUT_DIR)
+            if rel.startswith(".."):
+                rel = audio_path
+        except Exception:
+            rel = audio_path
+        rel = rel.replace("\\", "/")
+        encoded = quote(rel)
+        name = os.path.basename(audio_path) or audio_path
+        buttons = [
+            [
+                InlineKeyboardButton("Oui", callback_data=f"tr:yes:{encoded}"),
+                InlineKeyboardButton("Non", callback_data="tr:no"),
+            ]
+        ]
+        text = f"Transcrire l’audio ?\n{name}"
+        markup = InlineKeyboardMarkup(buttons)
+        self.send_message(chat_id, text, markup)
+
+    # ---- yt-dlp helpers ----
+    def _inspect_url(self, url: str) -> dict:
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "retries": 2,
+            "socket_timeout": 15,
+        }
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if info.get("entries"):
+            info = info["entries"][0]
+        return info or {}
+
+    def _build_options(self, info: dict) -> Tuple[str, List[Dict[str, Any]]]:
+        formats = info.get("formats") or []
+        duration = info.get("duration")
+        videos = list_video_formats(formats, mp4_friendly=True)
+        audio = pick_best_audio(formats, mp4_friendly=True)
+        title = info.get("title") or info.get("fulltitle") or info.get("original_url") or "Lien YouTube"
+        options: List[Dict[str, Any]] = []
+        for vf in videos[:8]:
+            vid_id = vf.get("format_id") or ""
+            fmt = vid_id
+            audio_id = ""
+            audio_label = ""
+            audio_size = None
+            if audio:
+                audio_id = audio.get("format_id") or ""
+                if audio_id:
+                    fmt = f"{vid_id}+{audio_id}"
+                audio_label = f"{audio.get('ext','')}/{audio.get('acodec','')}"
+                audio_size = estimate_size(audio, duration)
+            res = f"{vf.get('height') or ''}p"
+            fps = vf.get("fps")
+            vc = f"{vf.get('ext','')}/{vf.get('vcodec','')}"
+            vsize = estimate_size(vf, duration)
+            total = (vsize or 0) + (audio_size or 0)
+            parts = [res.strip() or "—", vc]
+            if fps:
+                parts.insert(1, f"{fps} fps")
+            label = " • ".join([p for p in parts if p])
+            approx = human_size(total) if total else "—"
+            detail = label
+            if audio_label:
+                detail += f" • Audio {audio_label}"
+            detail += f" • ≈ {approx}"
+            options.append({
+                "fmt": fmt,
+                "label": detail,
+            })
+        return title, options
+
+    # ---- PTB callbacks ----
+    async def _cmd_start(self, update, context):
+        msg = update.effective_message
+        if msg:
+            await msg.reply_text("Envoie-moi un lien YouTube pour lancer un téléchargement.")
+
+    async def _handle_text(self, update, context):
+        message = update.effective_message
+        if not message:
+            return
+        text = (message.text or "").strip()
+        match = YOUTUBE_REGEX.search(text)
+        if not match:
+            await message.reply_text("Je n’ai pas reconnu de lien YouTube. Envoie l’URL complète.")
+            return
+        url = match.group(1)
+        await message.reply_text("Analyse du lien…")
+        loop = asyncio.get_running_loop()
+        try:
+            info = await loop.run_in_executor(None, self._inspect_url, url)
+        except Exception as exc:
+            self.sig_info.emit(f"Inspection Telegram échouée : {exc}")
+            await message.reply_text("Impossible d’inspecter cette vidéo. Réessaie plus tard.")
+            return
+
+        title, options = self._build_options(info)
+        if not options:
+            await message.reply_text("Aucun format compatible trouvé pour cette vidéo.")
+            return
+
+        token = secrets.token_urlsafe(4)
+        self._pending_choices[token] = {
+            "url": url,
+            "options": options,
+            "title": title,
+        }
+
+        lines = [f"Formats disponibles pour « {title} » :", ""]
+        for idx, opt in enumerate(options, start=1):
+            lines.append(f"{idx}. {opt['label']}")
+        lines.append("")
+        lines.append("Choisis un format via les boutons ci-dessous.")
+
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+        buttons: List[List[Any]] = []
+        row: List[Any] = []
+        for idx in range(len(options)):
+            row.append(InlineKeyboardButton(str(idx + 1), callback_data=f"choose:{token}:{idx}"))
+            if len(row) == 4:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+
+        markup = InlineKeyboardMarkup(buttons)
+        await message.reply_text("\n".join(lines), reply_markup=markup)
+
+    async def _handle_callback(self, update, context):
+        query = update.callback_query
+        if not query:
+            return
+        data = query.data or ""
+        chat = query.message.chat if query.message else update.effective_chat
+        chat_id = chat.id if chat else None
+
+        if data.startswith("choose:"):
+            parts = data.split(":", 2)
+            if len(parts) != 3:
+                await query.answer("Choix invalide.")
+                return
+            token, idx_str = parts[1], parts[2]
+            entry = self._pending_choices.get(token)
+            if not entry:
+                await query.answer("Choix expiré.")
+                try:
+                    await query.edit_message_reply_markup(None)
+                except Exception:
+                    pass
+                return
+            try:
+                idx = int(idx_str)
+            except ValueError:
+                await query.answer("Choix invalide.")
+                return
+            options = entry.get("options") or []
+            if idx < 0 or idx >= len(options):
+                await query.answer("Choix invalide.")
+                return
+            option = options[idx]
+            if chat_id is None:
+                await query.answer("Chat introuvable.")
+                return
+            await query.answer("Téléchargement en cours…", show_alert=False)
+            try:
+                await query.edit_message_reply_markup(None)
+            except Exception:
+                pass
+            title = entry.get("title") or "Vidéo"
+            fmt = option.get("fmt") or ""
+            self.sig_download_requested.emit(entry.get("url", ""), fmt, chat_id, title)
+            self.send_message(chat_id, f"Format sélectionné : {option.get('label','')}\nTéléchargement demandé…")
+            self._pending_choices.pop(token, None)
+        elif data.startswith("tr:yes:"):
+            encoded = data[7:]
+            token_path = unquote(encoded)
+            try:
+                path_obj = pathlib.Path(token_path)
+                if not path_obj.is_absolute():
+                    path_obj = (OUT_DIR / token_path).resolve()
+            except Exception:
+                path_obj = pathlib.Path(token_path)
+            audio_path = str(path_obj)
+            await self._handle_transcription_yes(query, chat_id, audio_path)
+        elif data == "tr:no":
+            await query.answer("OK", show_alert=False)
+            try:
+                await query.edit_message_reply_markup(None)
+            except Exception:
+                pass
+            if chat_id is not None:
+                self.send_message(chat_id, "Transcription annulée.")
+        else:
+            await query.answer("Commande inconnue.")
+
+    async def _handle_transcription_yes(self, query, chat_id: Optional[int], audio_path: str):
+        if chat_id is None:
+            await query.answer("Chat introuvable.")
+            return
+        webhook_full = (self.app_config.get("webhook_full") or "").strip()
+        if not webhook_full:
+            await query.answer("Webhook non configuré.", show_alert=True)
+            self.send_message(chat_id, "Configure le webhook dans l’app avant de lancer une transcription.")
+            return
+        await query.answer("Envoi en cours…", show_alert=False)
+        loop = asyncio.get_running_loop()
+        status, body = await loop.run_in_executor(None, self._post_audio_to_webhook, webhook_full, audio_path)
+        try:
+            await query.edit_message_reply_markup(None)
+        except Exception:
+            pass
+        if status == 0:
+            self.send_message(chat_id, f"Transcription impossible : {body}")
+            return
+        snippet = body.strip()
+        if len(snippet) > 400:
+            snippet = snippet[:400] + "\n...[tronqué]..."
+        msg = f"Transcription lancée ✅ (HTTP {status})"
+        if snippet:
+            msg += f"\n{snippet}"
+        self.send_message(chat_id, msg)
+
+    def _post_audio_to_webhook(self, url: str, audio_path: str) -> Tuple[int, str]:
+        try:
+            import requests
+        except ImportError:
+            return 0, "Le module requests est manquant. Installe-le depuis l’app."
+        if not os.path.exists(audio_path):
+            return 0, f"Fichier introuvable : {audio_path}"
+        mime, _ = mimetypes.guess_type(audio_path)
+        mime = mime or "application/octet-stream"
+        basename = os.path.basename(audio_path)
+        try:
+            with open(audio_path, "rb") as handle:
+                files = {"data": (basename, handle, mime)}
+                resp = requests.post(url, files=files, timeout=(10, 600))
+            body = resp.text or ""
+            return resp.status_code, body
+        except Exception as exc:
+            return 0, str(exc)
+
+    # ---- QThread API ----
+    def run(self):
+        token = (self.app_config.get("telegram_token") or "").strip()
+        if not token:
+            self.sig_info.emit("Token Telegram manquant : bot non démarré.")
+            return
+        try:
+            from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
+        except Exception as exc:
+            self.sig_info.emit(f"Import python-telegram-bot impossible : {exc}")
+            return
+
+        mode = self.effective_mode
+        builder = Application.builder().token(token)
+        app = builder.build()
+        self._application = app
+
+        app.add_handler(CommandHandler("start", self._cmd_start))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text))
+        app.add_handler(CallbackQueryHandler(self._handle_callback))
+
+        self.sig_info.emit(f"Bot Telegram démarré en mode {mode}.")
+        try:
+            if mode == "webhook":
+                base = (self.app_config.get("webhook_base") or "").rstrip("/")
+                if not base:
+                    self.sig_info.emit("URL webhook absente, bascule en mode polling.")
+                    mode = "polling"
+                    self.effective_mode = "polling"
+                else:
+                    path = f"/tg/{token}"
+                    url_path = path.lstrip("/")
+                    webhook_url = base + path
+                    port = int(self.app_config.get("telegram_port") or 8081)
+                    self.sig_info.emit(f"Webhook : {webhook_url} (port {port})")
+                    app.run_webhook(
+                        listen="0.0.0.0",
+                        port=port,
+                        url_path=url_path,
+                        webhook_url=webhook_url,
+                        drop_pending_updates=True,
+                        stop_signals=None,
+                    )
+                    return
+            app.run_polling(drop_pending_updates=True, stop_signals=None)
+        except Exception as exc:
+            self.sig_info.emit(f"Erreur bot Telegram : {exc}")
+        finally:
+            self._pending_choices.clear()
+            self._application = None
+            self.sig_info.emit("Bot Telegram arrêté.")
+
+    def stop(self):
+        app = self._application
+        if not app:
+            return
+
+        async def _stop():
+            try:
+                await app.stop()
+            except Exception:
+                pass
+            try:
+                await app.shutdown()
+            except Exception:
+                pass
+
+        self._submit_async(_stop())
 # ---------------------- Utilitaires de fichiers ----------------------
 def _unique_path(dst: pathlib.Path) -> pathlib.Path:
     """
@@ -491,6 +898,7 @@ def delete_dir_if_empty(path: pathlib.Path):
 
 class YoutubeTab(QWidget):
     sig_request_transcription = Signal(list)
+    sig_audio_completed = Signal(int, str)  # chat_id, audio_path
 
     def __init__(self, app_ref, parent=None):
         super().__init__(parent)
@@ -905,7 +1313,9 @@ class YoutubeTab(QWidget):
                 pass
 
             audio_path = moved.get("audio") or task.final_audio_path
-            if audio_path:
+            if task.source == "telegram" and task.chat_id and audio_path:
+                self.sig_audio_completed.emit(task.chat_id, audio_path)
+            elif audio_path:
                 reply = QMessageBox.question(
                     self,
                     "Transcription",
@@ -917,7 +1327,13 @@ class YoutubeTab(QWidget):
         else:
             task.status = "Erreur"
             item.setText(f"[Erreur] {task.url}")
-            QMessageBox.warning(self, "Erreur", f"Échec du téléchargement :\n{msg}")
+            if task.source == "telegram" and task.chat_id:
+                main = self.window()
+                worker = getattr(main, "telegram_worker", None)
+                if worker:
+                    worker.send_message(task.chat_id, f"Échec du téléchargement : {msg}")
+            else:
+                QMessageBox.warning(self, "Erreur", f"Échec du téléchargement :\n{msg}")
         self.bar.setValue(0)
         self.current_worker = None
         self.btn_start.setEnabled(True)
@@ -1406,12 +1822,16 @@ class ComingSoonTab(QWidget):
 class SettingsTab(QWidget):
     """
     Onglet Paramètres généraux :
-    - Bouton 'Mettre à jour l’app' -> git pull origin main
-    - Bouton 'Redémarrer l’app'    -> relance le process et quitte l’instance actuelle
+    - Contrôle du thème
+    - Section Telegram (token, mode, démarrage)
+    - Outils de maintenance (git pull, redémarrage)
     """
-    def __init__(self, parent=None):
+
+    def __init__(self, app_ref=None, parent=None):
         super().__init__(parent)
+        self.app_ref = app_ref
         self.worker: CommandWorker | None = None
+        self._loading_cfg = False
         self.build_ui()
 
     def build_ui(self):
@@ -1427,7 +1847,44 @@ class SettingsTab(QWidget):
         theme_line.addStretch(1)
         root.addLayout(theme_line)
 
-        # Ligne boutons
+        # Section Telegram
+        grp_tg = QGroupBox("Telegram")
+        tg_layout = QVBoxLayout(grp_tg)
+
+        row_token = QHBoxLayout()
+        row_token.addWidget(QLabel("Token"))
+        self.ed_token = QLineEdit()
+        self.ed_token.setPlaceholderText("123456:ABC-DEF…")
+        row_token.addWidget(self.ed_token, 1)
+        tg_layout.addLayout(row_token)
+
+        row_mode = QHBoxLayout()
+        row_mode.addWidget(QLabel("Mode"))
+        self.cmb_mode = QComboBox()
+        self.cmb_mode.addItems(["Auto", "Polling", "Webhook"])
+        row_mode.addWidget(self.cmb_mode)
+        row_mode.addWidget(QLabel("Port"))
+        self.spin_port = QSpinBox()
+        self.spin_port.setRange(1, 65535)
+        self.spin_port.setValue(8081)
+        row_mode.addWidget(self.spin_port)
+        row_mode.addStretch(1)
+        tg_layout.addLayout(row_mode)
+
+        row_ctrl = QHBoxLayout()
+        self.btn_tg_start = QPushButton("Démarrer bot")
+        self.btn_tg_stop = QPushButton("Arrêter bot")
+        self.btn_tg_stop.setEnabled(False)
+        self.lab_tg = QLabel("Bot : inactif")
+        row_ctrl.addWidget(self.btn_tg_start)
+        row_ctrl.addWidget(self.btn_tg_stop)
+        row_ctrl.addStretch(1)
+        row_ctrl.addWidget(self.lab_tg)
+        tg_layout.addLayout(row_ctrl)
+
+        root.addWidget(grp_tg)
+
+        # Ligne boutons maintenance
         line = QHBoxLayout()
         self.btn_update = QPushButton("Mettre à jour l’app (git pull origin main)")
         self.btn_restart = QPushButton("Redémarrer l’app")
@@ -1440,13 +1897,67 @@ class SettingsTab(QWidget):
         # Zone de logs
         self.logs = QTextEdit()
         self.logs.setReadOnly(True)
-        self.logs.setPlaceholderText("Logs des opérations (git, etc.)...")
+        self.logs.setPlaceholderText("Logs des opérations (git, Telegram, etc.)...")
         root.addWidget(self.logs)
 
         # Info
         info = QLabel("Astuce : l’app cherchera la racine du dépôt (.git) en remontant depuis le dossier du script.")
         info.setWordWrap(True)
         root.addWidget(info)
+
+        # Connexions config Telegram
+        self.ed_token.textChanged.connect(lambda s: self._save_cfg("telegram_token", s.strip()))
+        self.cmb_mode.currentTextChanged.connect(lambda t: self._save_cfg("telegram_mode", (t or "auto").lower()))
+        self.spin_port.valueChanged.connect(lambda v: self._save_cfg("telegram_port", int(v)))
+
+    def init_from_config(self, cfg: dict):
+        self._loading_cfg = True
+        try:
+            token = cfg.get("telegram_token") or ""
+            self.ed_token.setText(token)
+            mode = (cfg.get("telegram_mode") or "auto").lower()
+            nice = mode.capitalize()
+            if nice not in ("Auto", "Polling", "Webhook"):
+                nice = "Auto"
+            self.cmb_mode.setCurrentText(nice)
+            port = cfg.get("telegram_port") or DEFAULT_CONFIG["telegram_port"]
+            try:
+                self.spin_port.setValue(int(port))
+            except Exception:
+                self.spin_port.setValue(DEFAULT_CONFIG["telegram_port"])
+            self.set_telegram_idle()
+        finally:
+            self._loading_cfg = False
+
+    def _save_cfg(self, key: str, value: Any):
+        if self._loading_cfg or not self.app_ref:
+            return
+        cfg = self.app_ref.app_config
+        if key == "telegram_token":
+            cfg[key] = value or ""
+        elif key == "telegram_mode":
+            cfg[key] = (value or "auto").lower()
+        elif key == "telegram_port":
+            try:
+                cfg[key] = int(value)
+            except Exception:
+                cfg[key] = DEFAULT_CONFIG["telegram_port"]
+        else:
+            cfg[key] = value
+        save_config(cfg)
+
+    def set_telegram_running(self, mode: str):
+        self.lab_tg.setText(f"Bot : en cours ({mode})")
+        self.btn_tg_start.setEnabled(False)
+        self.btn_tg_stop.setEnabled(True)
+
+    def set_telegram_idle(self):
+        self.lab_tg.setText("Bot : inactif")
+        self.btn_tg_start.setEnabled(True)
+        self.btn_tg_stop.setEnabled(False)
+
+    def append_telegram_info(self, text: str):
+        self.append_log(f"[Telegram] {text}")
 
     # ---------- Actions ----------
     def on_theme_change(self, _idx: int):
@@ -1519,9 +2030,13 @@ class Main(QWidget):
         self.setWindowTitle("FlowGrab — Video Downloader (yt-dlp)")
         root = QVBoxLayout(self)
         # PATCH START: tabs wiring + config + signaux
+        self.app_config = load_config()
+        self.telegram_worker: TelegramWorker | None = None
+
         self.youtube_tab = YoutubeTab(app_ref=QApplication.instance())
         self.transcription_tab = TranscriptionTab()
         self.serveur_tab = ServeurTab()
+        self.settings_tab = SettingsTab(app_ref=self)
 
         tabs = QTabWidget()
         tabs.addTab(self.youtube_tab, "YouTube")
@@ -1529,19 +2044,24 @@ class Main(QWidget):
         tabs.addTab(ComingSoonTab("À venir 2"), "À venir 2")
         tabs.addTab(ComingSoonTab("À venir 3"), "À venir 3")
         tabs.addTab(ComingSoonTab("À venir 4"), "À venir 4")
-        tabs.addTab(SettingsTab(), "Paramètres généraux")
+        tabs.addTab(self.settings_tab, "Paramètres généraux")
         tabs.addTab(self.serveur_tab, "Serveur")
         self.tabs = tabs
         root.addWidget(tabs)
 
         # Config JSON
-        self.app_config = load_config()
         self.transcription_tab.init_from_config(self.app_config)
+        self.settings_tab.init_from_config(self.app_config)
 
         # Signaux inter-onglets
         self.serveur_tab.sig_public_url.connect(self.on_cloudflare_public_url)       # base
         self.youtube_tab.sig_request_transcription.connect(self.on_transcription_request)
+        self.youtube_tab.sig_audio_completed.connect(self.on_audio_ready_from_youtube)
         self.transcription_tab.sig_url_changed.connect(self.on_transcription_url_changed)
+
+        # Paramètres Telegram
+        self.settings_tab.btn_tg_start.clicked.connect(self.start_telegram)
+        self.settings_tab.btn_tg_stop.clicked.connect(self.stop_telegram)
         # PATCH END
 
         start_notification_server(self)
@@ -1579,6 +2099,86 @@ class Main(QWidget):
         })
         save_config(self.app_config)
     # PATCH END
+
+    # PATCH START: Telegram intégration
+    def _effective_telegram_mode(self) -> str:
+        mode = (self.app_config.get("telegram_mode") or "auto").lower()
+        base = (self.app_config.get("webhook_base") or "").strip()
+        if mode == "auto":
+            return "webhook" if base else "polling"
+        if mode not in ("polling", "webhook"):
+            return "polling"
+        if mode == "webhook" and not base:
+            return "polling"
+        return mode
+
+    def start_telegram(self):
+        token = (self.app_config.get("telegram_token") or "").strip()
+        if not token:
+            QMessageBox.warning(self, "Token manquant", "Renseigne le token du bot Telegram dans les paramètres.")
+            return
+        if self.telegram_worker and self.telegram_worker.isRunning():
+            QMessageBox.information(self, "Bot actif", "Le bot Telegram est déjà démarré.")
+            return
+        worker = TelegramWorker(self.app_config)
+        self.telegram_worker = worker
+        worker.sig_download_requested.connect(self.on_tg_download_requested)
+        worker.sig_info.connect(self.on_telegram_info)
+        worker.finished.connect(self.on_telegram_finished)
+        mode = worker.effective_mode or self._effective_telegram_mode()
+        if self.settings_tab:
+            self.settings_tab.set_telegram_running(mode)
+            self.settings_tab.append_telegram_info(f"Démarrage bot ({mode})")
+        worker.start()
+
+    def stop_telegram(self):
+        if not self.telegram_worker:
+            if self.settings_tab:
+                self.settings_tab.set_telegram_idle()
+            return
+        worker = self.telegram_worker
+        if self.settings_tab:
+            self.settings_tab.append_telegram_info("Arrêt du bot demandé…")
+        worker.stop()
+        worker.wait(5000)
+        self.telegram_worker = None
+        if self.settings_tab:
+            self.settings_tab.set_telegram_idle()
+
+    def on_telegram_finished(self):
+        if self.settings_tab:
+            self.settings_tab.set_telegram_idle()
+        if self.telegram_worker and not self.telegram_worker.isRunning():
+            self.telegram_worker = None
+
+    def on_telegram_info(self, text: str):
+        if self.settings_tab:
+            self.settings_tab.append_telegram_info(text)
+
+    def on_tg_download_requested(self, url: str, fmt: str, chat_id: int, title: str):
+        item = self.youtube_tab.append_task(url)
+        task: Task = item.data(Qt.UserRole)
+        task.selected_fmt = fmt
+        task.source = "telegram"
+        task.chat_id = chat_id
+        self.youtube_tab.statusBar(f"Téléchargement demandé par Telegram — {title}")
+        self.youtube_tab.start_queue()
+        if self.telegram_worker:
+            self.telegram_worker.send_message(chat_id, "Téléchargement lancé…")
+
+    def on_audio_ready_from_youtube(self, chat_id: int, audio_path: str):
+        if not self.telegram_worker:
+            return
+        name = os.path.basename(audio_path) or audio_path
+        self.telegram_worker.send_message(chat_id, f"Téléchargement terminé ✅\n{name}")
+        self.telegram_worker.ask_transcription(chat_id, audio_path)
+    # PATCH END
+
+    def closeEvent(self, event):
+        try:
+            self.stop_telegram()
+        finally:
+            super().closeEvent(event)
 
 # ---------------------- main ----------------------
 if __name__ == "__main__":
