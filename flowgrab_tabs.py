@@ -47,6 +47,22 @@ def normalize_yt(u: str) -> str:
     except Exception:
         return u
 
+
+def extract_basic_info(url: str) -> dict:
+    """Récupère les métadonnées d'une vidéo sans lancer de téléchargement."""
+    u = normalize_yt(url)
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "retries": 2,
+        "socket_timeout": 15,
+    }
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(u, download=False)
+    if info and info.get("entries"):
+        info = info["entries"][0]
+    return info or {}
+
 # PATCH START: config persistante
 CONFIG_PATH = OUT_DIR / "flowgrab_config.json"
 
@@ -269,8 +285,10 @@ class DownloadWorker(QThread):
 
         try:
             url = normalize_yt(self.task.url)
+            retcode = 0
             with YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
+                retcode = getattr(ydl, "_download_retcode", 0) or 0
 
             fn = captured["fn"]
             if not fn and info:
@@ -282,6 +300,32 @@ class DownloadWorker(QThread):
                     pass
 
             if not info:
+                reused_info = {}
+                if retcode == 0:
+                    try:
+                        reused_info = extract_basic_info(url)
+                    except Exception:
+                        reused_info = {}
+
+                if reused_info and retcode == 0:
+                    video_id = reused_info.get("id") or ""
+                    existing = find_existing_outputs(video_id)
+                    if (not video_id) or (not existing.get("audio") and not existing.get("video")):
+                        raise RuntimeError(
+                            "Téléchargement déjà enregistré dans l’archive mais aucun fichier final n’a été retrouvé. "
+                            "Supprime l’entrée correspondante dans archive.txt pour forcer un nouveau téléchargement."
+                        )
+                    if existing.get("audio"):
+                        self.task.final_audio_path = existing["audio"]
+                    if existing.get("video"):
+                        self.task.final_video_path = existing["video"]
+                    reuse_msg = existing.get("audio") or existing.get("video") or "Déjà téléchargé (archive)"
+                    if video_id:
+                        self.task.video_id = video_id
+                    self.sig_status.emit("Déjà téléchargé (archive)")
+                    self.sig_done.emit(True, reuse_msg, reused_info or {})
+                    return
+
                 raise RuntimeError("yt-dlp n’a renvoyé aucune information (URL invalide, vidéo privée ou cookies requis).")
 
             if fn:
@@ -332,17 +376,7 @@ class InspectWorker(QThread):
 
     def run(self):
         try:
-            u = normalize_yt(self.url)
-            ydl_opts = {
-                "quiet": True,
-                "no_warnings": True,
-                "retries": 2,
-                "socket_timeout": 15,
-            }
-            with YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(u, download=False)
-            if info and info.get("entries"):
-                info = info["entries"][0]
+            info = extract_basic_info(self.url)
             self.sig_done.emit(self.url, info or {})
         except Exception as e:
             self.sig_error.emit(self.url, str(e))
@@ -952,6 +986,47 @@ def _unique_path(dst: pathlib.Path) -> pathlib.Path:
         if not cand.exists():
             return cand
         i += 1
+
+
+def find_existing_outputs(video_id: str) -> dict:
+    """Cherche des fichiers audio/vidéo déjà produits pour l'ID donné."""
+    found = {"audio": None, "video": None}
+    if not video_id:
+        return found
+
+    token = f"[{video_id}]"
+
+    def _pick_latest(paths: list[pathlib.Path]) -> Optional[pathlib.Path]:
+        if not paths:
+            return None
+        try:
+            return max(paths, key=lambda p: p.stat().st_mtime)
+        except Exception:
+            return paths[0]
+
+    audio_exts = {".mp3", ".m4a", ".wav", ".ogg", ".flac"}
+    video_exts = {".mp4", ".mkv", ".webm", ".mov"}
+
+    try:
+        audio_candidates = [
+            p for p in AUDIOS_DIR.glob(f"*{token}*")
+            if p.is_file() and p.suffix.lower() in audio_exts
+        ]
+        video_candidates = [
+            p for p in VIDEOS_DIR.glob(f"*{token}*")
+            if p.is_file() and p.suffix.lower() in video_exts
+        ]
+
+        audio_path = _pick_latest(audio_candidates)
+        video_path = _pick_latest(video_candidates)
+        if audio_path:
+            found["audio"] = str(audio_path)
+        if video_path:
+            found["video"] = str(video_path)
+    except Exception:
+        pass
+
+    return found
 
 
 def move_final_outputs(task: Task) -> dict:
