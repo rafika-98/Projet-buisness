@@ -30,6 +30,31 @@ YOUTUBE_REGEX = re.compile(
     re.IGNORECASE,
 )
 
+BROWSER_TRY_ORDER = ("edge", "chrome", "brave", "vivaldi", "opera", "chromium", "firefox")
+
+
+def _pick_browser_for_cookies(cfg: dict) -> str:
+    pref = (cfg.get("browser_cookies") or "auto").strip().lower()
+    if pref != "auto":
+        return pref
+    return BROWSER_TRY_ORDER[0]
+
+
+def _apply_cookies_to_opts(opts: dict, cfg: dict) -> None:
+    """
+    - Si cookies.txt est présent -> l'utiliser.
+    - Sinon -> cookiesfrombrowser=(<navigateur>, None, None, None)
+    """
+    cookies = (cfg.get("cookies_path") or "").strip()
+    if cookies:
+        opts["cookiefile"] = cookies
+        opts.pop("cookiesfrombrowser", None)
+        return
+
+    browser = _pick_browser_for_cookies(cfg)
+    opts.pop("cookiefile", None)
+    opts["cookiesfrombrowser"] = (browser, None, None, None)
+
 
 def _ptb_major_minor() -> tuple[int, int]:
     try:
@@ -87,9 +112,7 @@ def extract_basic_info(url: str) -> dict:
         "socket_timeout": 15,
         "http_headers": {"User-Agent": cfg.get("user_agent") or ""},
     }
-    cookies = (cfg.get("cookies_path") or "").strip()
-    if cookies:
-        ydl_opts["cookiefile"] = cookies
+    _apply_cookies_to_opts(ydl_opts, cfg)
 
     last_exc: Exception | None = None
     for attempt in range(3):
@@ -123,20 +146,34 @@ DEFAULT_CONFIG = {
     "telegram_port": 8081,
     "cookies_path": "",
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "browser_cookies": "auto",  # "auto" | "edge" | "chrome" | "firefox" | "brave" | "vivaldi" | "opera" | "chromium"
 }
 
 
 def _ensure_config_defaults(data: Optional[dict]) -> dict:
     cfg = dict(DEFAULT_CONFIG)
     if isinstance(data, dict):
-        for key, value in data.items():
-            if value is None:
-                continue
-            cfg[key] = value
-    cfg["telegram_mode"] = "polling"
-    cfg["telegram_port"] = DEFAULT_CONFIG["telegram_port"]
+        for k, v in data.items():
+            if v is not None:
+                cfg[k] = v
+
+    mode = (cfg.get("telegram_mode") or "auto").lower()
+    if mode not in ("auto", "polling", "webhook"):
+        mode = "auto"
+    cfg["telegram_mode"] = mode
+
+    try:
+        cfg["telegram_port"] = int(cfg.get("telegram_port") or DEFAULT_CONFIG["telegram_port"])
+    except Exception:
+        cfg["telegram_port"] = DEFAULT_CONFIG["telegram_port"]
+
     cfg["cookies_path"] = (cfg.get("cookies_path") or "").strip()
     cfg["user_agent"] = (cfg.get("user_agent") or DEFAULT_CONFIG["user_agent"]).strip()
+
+    bc = (cfg.get("browser_cookies") or "auto").strip().lower()
+    allowed = {"auto", "edge", "chrome", "firefox", "brave", "vivaldi", "opera", "chromium"}
+    cfg["browser_cookies"] = bc if bc in allowed else "auto"
+
     return cfg
 
 
@@ -395,9 +432,7 @@ class DownloadWorker(QThread):
             headers = dict(opts.get("http_headers") or {})
             headers["User-Agent"] = user_agent
             opts["http_headers"] = headers
-        cookies = (cfg.get("cookies_path") or "").strip()
-        if cookies:
-            opts["cookiefile"] = cookies
+        _apply_cookies_to_opts(opts, cfg)
 
         try:
             url = normalize_yt(self.task.url)
