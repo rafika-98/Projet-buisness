@@ -12,8 +12,10 @@ OUT_DIR = pathlib.Path(r"C:\Users\Lamine\Desktop\Projet final\Application\downlo
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 VIDEOS_DIR = OUT_DIR / "Videos"
 AUDIOS_DIR = OUT_DIR / "Audios"
+TRANSCRIPTION_DIR = OUT_DIR / "Transcription"
 VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
 AUDIOS_DIR.mkdir(parents=True, exist_ok=True)
+TRANSCRIPTION_DIR.mkdir(parents=True, exist_ok=True)
 DOWNLOAD_ARCHIVE = OUT_DIR / "archive.txt"
 
 from typing import Optional, List, Dict, Any, Tuple, TYPE_CHECKING, Callable
@@ -64,6 +66,14 @@ def normalize_yt(u: str) -> str:
         return u
     except Exception:
         return u
+
+
+def _is_path_in_dir(candidate: pathlib.Path, directory: pathlib.Path) -> bool:
+    try:
+        candidate.relative_to(directory)
+        return True
+    except ValueError:
+        return False
 
 
 def extract_basic_info(url: str) -> dict:
@@ -247,6 +257,19 @@ def start_notification_server(parent_widget=None) -> None:
         if request.args.get("token") != TOKEN:
             return {"status": "forbidden"}, 403
 
+        def _purge_transcription_segments():
+            try:
+                if not TRANSCRIPTION_DIR.exists():
+                    return
+                for p in TRANSCRIPTION_DIR.glob("audio_partie_*.aac"):
+                    try:
+                        if p.is_file():
+                            p.unlink()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
         def show_message_box():
             parent = _notification_parent_widget
             if parent is not None and hasattr(parent, "isVisible") and not parent.isVisible():
@@ -256,6 +279,7 @@ def start_notification_server(parent_widget=None) -> None:
             QMessageBox.information(parent, "Notification N8N", "La transcription est terminée.")
 
         QTimer.singleShot(0, show_message_box)
+        QTimer.singleShot(0, _purge_transcription_segments)
         threading.Thread(target=_send_windows_notification, args=("La transcription est terminée.",), daemon=True).start()
         return {"status": "ok"}
 
@@ -866,6 +890,18 @@ class TelegramWorker(QThread):
         if status == 0:
             self.send_message(chat_id, f"Transcription impossible : {body}")
             return
+        if 200 <= status < 300:
+            base_dir = AUDIOS_DIR.resolve()
+            try:
+                resolved = pathlib.Path(audio_path).resolve()
+            except Exception:
+                resolved = None
+            if resolved and _is_path_in_dir(resolved, base_dir):
+                try:
+                    if resolved.exists():
+                        resolved.unlink()
+                except Exception:
+                    pass
         snippet = body.strip()
         if len(snippet) > 400:
             snippet = snippet[:400] + "\n...[tronqué]..."
@@ -1848,6 +1884,7 @@ class ServeurTab(QWidget):
         self.worker: LongProcWorker | None = None
         self.ps_file: str | None = None
         self._pid: int | None = None
+        self._last_public_url: str | None = None
         self.build_ui()
 
     def build_ui(self):
@@ -1858,11 +1895,15 @@ class ServeurTab(QWidget):
         self.btn_on = QPushButton("Allumer")
         self.btn_off = QPushButton("Éteindre")
         self.btn_off.setEnabled(False)
+        self.btn_open = QPushButton("Ouvrir n8n")
+        self.btn_open.setEnabled(False)
         self.lab_status = QLabel("Statut : inactif")
         self.btn_on.clicked.connect(self.start)
         self.btn_off.clicked.connect(self.stop)
+        self.btn_open.clicked.connect(self.open_n8n)
         row.addWidget(self.btn_on)
         row.addWidget(self.btn_off)
+        row.addWidget(self.btn_open)
         row.addStretch(1)
         row.addWidget(self.lab_status)
         root.addLayout(row)
@@ -1878,7 +1919,16 @@ class ServeurTab(QWidget):
         self.logs.append(s)
         m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", s)
         if m:
-            self.sig_public_url.emit(m.group(0))
+            url = m.group(0)
+            self._last_public_url = url
+            self.sig_public_url.emit(url)
+
+    def open_n8n(self):
+        url = self._last_public_url or "http://localhost:5678"
+        try:
+            QDesktopServices.openUrl(QUrl(url))
+        except Exception:
+            pass
 
     # --- start/stop ---
     def start(self):
@@ -1991,6 +2041,7 @@ Write-Host "Terminé."
         self.lab_status.setText("Statut : démarrage…")
         self.btn_on.setEnabled(False)
         self.btn_off.setEnabled(True)
+        self.btn_open.setEnabled(False)
 
         self.worker = LongProcWorker(args, env=os.environ.copy(), parent=self)
         self.worker.sig_started.connect(self.on_started)
@@ -2002,10 +2053,13 @@ Write-Host "Terminé."
         self._pid = pid
         self.lab_status.setText(f"Statut : en cours (pid {pid})")
         self.log(f"[ps] démarré (pid {pid})")
+        self.btn_open.setEnabled(True)
 
     def stop(self):
         self.lab_status.setText("Statut : arrêt…")
         self.log(">>> Extinction demandée…")
+        self.btn_open.setEnabled(False)
+        self._last_public_url = None
         if self.worker and self.worker.isRunning():
             self.worker.stop()
         else:
@@ -2016,6 +2070,8 @@ Write-Host "Terminé."
         self.lab_status.setText("Statut : inactif")
         self.btn_on.setEnabled(True)
         self.btn_off.setEnabled(False)
+        self.btn_open.setEnabled(False)
+        self._last_public_url = None
         self._pid = None
         self.worker = None
         if self.ps_file:
@@ -2104,6 +2160,7 @@ class TranscriptionTab(QWidget):
         self.last_dir: str | None = None
         self._updating_url = False
         self._webhook_path = "/webhook/Audio"
+        self._pending_delete: list[str] = []
         self.build_ui()
         self.update_send_button()
 
@@ -2239,6 +2296,7 @@ class TranscriptionTab(QWidget):
             return
 
         self.btn_send.setEnabled(False)
+        self._pending_delete = files[:]
         self.worker = MultiUploadWorker(url, files, self)
         self.worker.sig_log.connect(self.logs.append)
         self.worker.sig_done.connect(self.on_sent_done)
@@ -2253,12 +2311,26 @@ class TranscriptionTab(QWidget):
         self.update_send_button()
         if ok:
             QMessageBox.information(self, "OK", "Tous les envois ont réussi.")
+            base_dir = AUDIOS_DIR.resolve()
+            for path in self._pending_delete:
+                try:
+                    resolved = pathlib.Path(path).resolve()
+                except Exception:
+                    continue
+                if not _is_path_in_dir(resolved, base_dir):
+                    continue
+                try:
+                    if resolved.exists():
+                        resolved.unlink()
+                except Exception:
+                    pass
         else:
             QMessageBox.warning(
                 self,
                 "Terminé avec erreurs",
                 "Au moins un fichier a échoué. Consulte les logs pour les détails.",
             )
+        self._pending_delete = []
 
     def clear_selection_and_logs(self):
         self.selected_paths.clear()
