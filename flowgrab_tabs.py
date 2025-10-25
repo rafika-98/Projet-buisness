@@ -18,7 +18,7 @@ AUDIOS_DIR.mkdir(parents=True, exist_ok=True)
 TRANSCRIPTION_DIR.mkdir(parents=True, exist_ok=True)
 DOWNLOAD_ARCHIVE = OUT_DIR / "archive.txt"
 
-from typing import Optional, List, Dict, Any, Tuple, TYPE_CHECKING, Callable
+from typing import Optional, List, Dict, Any, TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:  # pragma: no cover - typing uniquement
     from telegram.ext import Application
@@ -33,13 +33,6 @@ YOUTUBE_REGEX = re.compile(
 BROWSER_TRY_ORDER = ("edge", "chrome", "brave", "vivaldi", "opera", "chromium", "firefox")
 
 
-def _pick_browser_for_cookies(cfg: dict) -> str:
-    pref = (cfg.get("browser_cookies") or "auto").strip().lower()
-    if pref != "auto":
-        return pref
-    return BROWSER_TRY_ORDER[0]
-
-
 def _apply_cookies_to_opts(opts: dict, cfg: dict) -> None:
     """
     - Si cookies.txt est présent -> l'utiliser.
@@ -51,9 +44,23 @@ def _apply_cookies_to_opts(opts: dict, cfg: dict) -> None:
         opts.pop("cookiesfrombrowser", None)
         return
 
-    browser = _pick_browser_for_cookies(cfg)
+    order = _browser_fallback_order(cfg)
+    browser = order[0] if order else BROWSER_TRY_ORDER[0]
     opts.pop("cookiefile", None)
     opts["cookiesfrombrowser"] = (browser, None, None, None)
+
+
+def _is_dpapi_error(exc: Exception) -> bool:
+    msg = (str(exc) or "").lower()
+    needles = ("dpapi", "decrypt", "encrypted_key", "os_crypt", "failed to decrypt")
+    return any(k in msg for k in needles)
+
+
+def _browser_fallback_order(cfg: dict) -> list[str]:
+    pref = (cfg.get("browser_cookies") or "auto").strip().lower()
+    if pref != "auto":
+        return [pref]
+    return list(BROWSER_TRY_ORDER)
 
 
 def _ptb_major_minor() -> tuple[int, int]:
@@ -105,33 +112,73 @@ def extract_basic_info(url: str) -> dict:
     """Récupère les métadonnées d'une vidéo sans lancer de téléchargement."""
     u = normalize_yt(url)
     cfg = load_config()
-    ydl_opts: dict[str, Any] = {
+    user_agent = (cfg.get("user_agent") or DEFAULT_CONFIG["user_agent"]).strip()
+    base_opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
         "retries": 2,
         "socket_timeout": 15,
-        "http_headers": {"User-Agent": cfg.get("user_agent") or ""},
     }
-    _apply_cookies_to_opts(ydl_opts, cfg)
+    if user_agent:
+        base_opts["http_headers"] = {"User-Agent": user_agent}
 
-    last_exc: Exception | None = None
-    for attempt in range(3):
+    cookies_path = (cfg.get("cookies_path") or "").strip()
+
+    def _extract(local_opts: dict[str, Any]) -> dict:
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                with YoutubeDL(local_opts) as ydl:
+                    info = ydl.extract_info(u, download=False)
+                if info and info.get("entries"):
+                    info = info["entries"][0]
+                return info or {}
+            except Exception as exc:  # pragma: no cover - dépend du réseau
+                last_exc = exc
+                msg = (str(exc) or "").lower()
+                if "429" in msg or "too many requests" in msg:
+                    _backoff_sleep(attempt)
+                    continue
+                raise
+        if last_exc:
+            raise last_exc
+        return {}
+
+    if cookies_path:
+        legacy_opts = dict(base_opts)
+        legacy_opts["cookiefile"] = cookies_path
+        legacy_opts.pop("cookiesfrombrowser", None)
+        return _extract(legacy_opts)
+
+    dpapi_failed = False
+    last_error: Exception | None = None
+    for browser in _browser_fallback_order(cfg):
+        local_opts = dict(base_opts)
+        local_opts["cookiesfrombrowser"] = (browser, None, None, None)
         try:
-            with YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(u, download=False)
-            if info and info.get("entries"):
-                info = info["entries"][0]
-            return info or {}
-        except Exception as exc:  # pragma: no cover - dépend du réseau
-            last_exc = exc
-            msg = str(exc)
-            if "429" in msg or "Too Many Requests" in msg:
-                _backoff_sleep(attempt)
+            return _extract(local_opts)
+        except Exception as exc:
+            last_error = exc
+            if _is_dpapi_error(exc):
+                dpapi_failed = True
                 continue
-            break
-    if last_exc:
-        raise last_exc
-    return {}
+            msg = (str(exc) or "").lower()
+            if "pycryptodomex" in msg or "cryptodome" in msg:
+                raise RuntimeError(
+                    "Lecture des cookies Firefox impossible : installe le paquet 'pycryptodomex' (pip install pycryptodomex)."
+                )
+            raise
+
+    if dpapi_failed:
+        raise RuntimeError(
+            "Impossible de lire les cookies du navigateur (échec du déchiffrement DPAPI). "
+            "Lance l’application sans privilèges administrateur, avec le même compte Windows que le navigateur, "
+            "ou force \"browser_cookies\" = \"firefox\" dans flowgrab_config.json. "
+            "Si Firefox est utilisé, installe aussi le paquet 'pycryptodomex'."
+        )
+    if last_error:
+        raise last_error
+    raise RuntimeError("Impossible de récupérer les informations vidéo (cookies navigateur indisponibles).")
 
 # PATCH START: config persistante
 CONFIG_PATH = OUT_DIR / "flowgrab_config.json"
@@ -157,18 +204,11 @@ def _ensure_config_defaults(data: Optional[dict]) -> dict:
             if v is not None:
                 cfg[k] = v
 
-    mode = (cfg.get("telegram_mode") or "auto").lower()
-    if mode not in ("auto", "polling", "webhook"):
-        mode = "auto"
-    cfg["telegram_mode"] = mode
-
-    try:
-        cfg["telegram_port"] = int(cfg.get("telegram_port") or DEFAULT_CONFIG["telegram_port"])
-    except Exception:
-        cfg["telegram_port"] = DEFAULT_CONFIG["telegram_port"]
-
-    cfg["cookies_path"] = (cfg.get("cookies_path") or "").strip()
-    cfg["user_agent"] = (cfg.get("user_agent") or DEFAULT_CONFIG["user_agent"]).strip()
+    # Valeurs forcées (compatibilité lecture mais écrasement silencieux)
+    cfg["telegram_mode"] = "polling"
+    cfg["telegram_port"] = DEFAULT_CONFIG["telegram_port"]
+    cfg["cookies_path"] = ""
+    cfg["user_agent"] = DEFAULT_CONFIG["user_agent"]
 
     bc = (cfg.get("browser_cookies") or "auto").strip().lower()
     allowed = {"auto", "edge", "chrome", "firefox", "brave", "vivaldi", "opera", "chromium"}
@@ -436,26 +476,69 @@ class DownloadWorker(QThread):
 
         try:
             url = normalize_yt(self.task.url)
-            retcode = 0
+            cookies_path = (cfg.get("cookies_path") or "").strip()
+
+            def _download_with_opts(local_opts: dict[str, Any]) -> tuple[dict[str, Any], int]:
+                last_exc: Exception | None = None
+                for attempt in range(3):
+                    try:
+                        with YoutubeDL(local_opts) as ydl:
+                            info_inner = ydl.extract_info(url, download=True)
+                            ret = getattr(ydl, "_download_retcode", 0) or 0
+                        return info_inner, ret
+                    except Exception as exc:
+                        last_exc = exc
+                        msg = (str(exc) or "").lower()
+                        if "429" in msg or "too many requests" in msg:
+                            self.sig_status.emit("yt-dlp : HTTP 429, nouvelle tentative…")
+                            _backoff_sleep(attempt)
+                            continue
+                        raise
+                if last_exc:
+                    raise last_exc
+                return {}, 0
+
             info: dict[str, Any] = {}
-            last_exc: Exception | None = None
-            for attempt in range(3):
-                try:
-                    with YoutubeDL(opts) as ydl:
-                        info = ydl.extract_info(url, download=True)
-                        retcode = getattr(ydl, "_download_retcode", 0) or 0
-                    last_exc = None
-                    break
-                except Exception as exc:
-                    last_exc = exc
-                    msg = str(exc)
-                    if "429" in msg or "Too Many Requests" in msg:
-                        self.sig_status.emit("yt-dlp : HTTP 429, nouvelle tentative…")
-                        _backoff_sleep(attempt)
-                        continue
-                    raise
-            if last_exc:
-                raise last_exc
+            retcode = 0
+            dpapi_failed = False
+            last_error: Exception | None = None
+
+            if cookies_path:
+                legacy_opts = dict(opts)
+                legacy_opts["cookiefile"] = cookies_path
+                legacy_opts.pop("cookiesfrombrowser", None)
+                info, retcode = _download_with_opts(legacy_opts)
+                opts = legacy_opts
+            else:
+                for browser in _browser_fallback_order(cfg):
+                    local_opts = dict(opts)
+                    local_opts["cookiesfrombrowser"] = (browser, None, None, None)
+                    try:
+                        info, retcode = _download_with_opts(local_opts)
+                        opts = local_opts
+                        break
+                    except Exception as exc:
+                        last_error = exc
+                        if _is_dpapi_error(exc):
+                            dpapi_failed = True
+                            continue
+                        msg = (str(exc) or "").lower()
+                        if "pycryptodomex" in msg or "cryptodome" in msg:
+                            raise RuntimeError(
+                                "Lecture des cookies Firefox impossible : installe le paquet 'pycryptodomex' (pip install pycryptodomex)."
+                            )
+                        raise
+                else:
+                    if dpapi_failed:
+                        raise RuntimeError(
+                            "Impossible de lire les cookies du navigateur (échec du déchiffrement DPAPI). "
+                            "Lance l’application sans privilèges administrateur, avec le même compte Windows que le navigateur, "
+                            "ou force \"browser_cookies\" = \"firefox\" dans flowgrab_config.json. "
+                            "Si Firefox est utilisé, installe aussi le paquet 'pycryptodomex'."
+                        )
+                    if last_error:
+                        raise last_error
+                    raise RuntimeError("Téléchargement impossible : cookies navigateur indisponibles.")
 
             fn = captured["fn"]
             if not fn and info:
@@ -2505,7 +2588,9 @@ class SettingsTab(QWidget):
         root.addLayout(theme_line)
         self.cmb_theme.setCurrentText("Sombre")
         theme_label.setVisible(False)
+        theme_label.setEnabled(False)
         self.cmb_theme.setVisible(False)
+        self.cmb_theme.setEnabled(False)
 
         # Section Telegram
         grp_tg = QGroupBox("Telegram")
@@ -2538,9 +2623,13 @@ class SettingsTab(QWidget):
         row_mode.addStretch(1)
         tg_layout.addLayout(row_mode)
         self.lbl_mode.setVisible(False)
+        self.lbl_mode.setEnabled(False)
         self.cmb_mode.setVisible(False)
+        self.cmb_mode.setEnabled(False)
         self.lbl_port.setVisible(False)
+        self.lbl_port.setEnabled(False)
         self.spin_port.setVisible(False)
+        self.spin_port.setEnabled(False)
 
         row_cookies = QHBoxLayout()
         row_cookies.setSpacing(8)
@@ -2557,8 +2646,11 @@ class SettingsTab(QWidget):
         row_cookies.addWidget(self.btn_cookies)
         tg_layout.addLayout(row_cookies)
         self.lbl_cookies.setVisible(False)
+        self.lbl_cookies.setEnabled(False)
         self.ed_cookies.setVisible(False)
+        self.ed_cookies.setEnabled(False)
         self.btn_cookies.setVisible(False)
+        self.btn_cookies.setEnabled(False)
 
         row_user_agent = QHBoxLayout()
         row_user_agent.setSpacing(8)
@@ -2569,7 +2661,9 @@ class SettingsTab(QWidget):
         row_user_agent.addWidget(self.ed_user_agent, 1)
         tg_layout.addLayout(row_user_agent)
         self.lbl_user_agent.setVisible(False)
+        self.lbl_user_agent.setEnabled(False)
         self.ed_user_agent.setVisible(False)
+        self.ed_user_agent.setEnabled(False)
 
         row_ctrl = QHBoxLayout()
         row_ctrl.setSpacing(8)
@@ -2793,10 +2887,11 @@ class SettingsTab(QWidget):
         app = QApplication.instance()
         if not app:
             return
-        if self.cmb_theme.currentText() == "Sombre":
-            apply_dark_theme(app)
-        else:
-            apply_light_theme(app)
+        apply_dark_theme(app)
+        if self.cmb_theme.currentText() != "Sombre":
+            self.cmb_theme.blockSignals(True)
+            self.cmb_theme.setCurrentText("Sombre")
+            self.cmb_theme.blockSignals(False)
 
     def on_update_clicked(self):
         import os, sys, subprocess, pathlib
@@ -2886,6 +2981,24 @@ class SettingsTab(QWidget):
 class Main(QWidget):
     def __init__(self):
         super().__init__()
+
+        def _is_elevated_win() -> bool:
+            if not sys.platform.startswith("win"):
+                return False
+            try:
+                import ctypes
+
+                return bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore[attr-defined]
+            except Exception:
+                return False
+
+        if _is_elevated_win():
+            QMessageBox.information(
+                self,
+                "Conseil",
+                "L’application tourne en mode administrateur. Si les cookies Chromium ne se déchiffrent pas (DPAPI), "
+                "relance l’app sans élévation ou force 'browser_cookies' = 'firefox' dans flowgrab_config.json.",
+            )
         self.setWindowTitle("FlowGrab — Video Downloader (yt-dlp)")
         root = QVBoxLayout(self)
         # PATCH START: tabs wiring + config + signaux
