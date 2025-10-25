@@ -119,7 +119,7 @@ DEFAULT_CONFIG = {
     "webhook_full": "",
     "last_updated": "",
     "telegram_token": "",
-    "telegram_mode": "auto",
+    "telegram_mode": "polling",
     "telegram_port": 8081,
     "cookies_path": "",
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -133,14 +133,8 @@ def _ensure_config_defaults(data: Optional[dict]) -> dict:
             if value is None:
                 continue
             cfg[key] = value
-    mode = (cfg.get("telegram_mode") or "auto").lower()
-    if mode not in ("auto", "polling", "webhook"):
-        mode = "auto"
-    cfg["telegram_mode"] = mode
-    try:
-        cfg["telegram_port"] = int(cfg.get("telegram_port") or DEFAULT_CONFIG["telegram_port"])
-    except Exception:
-        cfg["telegram_port"] = DEFAULT_CONFIG["telegram_port"]
+    cfg["telegram_mode"] = "polling"
+    cfg["telegram_port"] = DEFAULT_CONFIG["telegram_port"]
     cfg["cookies_path"] = (cfg.get("cookies_path") or "").strip()
     cfg["user_agent"] = (cfg.get("user_agent") or DEFAULT_CONFIG["user_agent"]).strip()
     return cfg
@@ -708,15 +702,7 @@ class TelegramWorker(QThread):
 
     # ---- helpers ----
     def _resolve_mode(self) -> str:
-        mode = (self.app_config.get("telegram_mode") or "auto").lower()
-        base = (self.app_config.get("webhook_base") or "").strip()
-        if mode == "auto":
-            return "webhook" if base else "polling"
-        if mode == "webhook" and not base:
-            return "polling"
-        if mode not in ("polling", "webhook"):
-            return "polling"
-        return mode
+        return "polling"
 
     def send_message(self, chat_id: int | str, text: str, reply_markup: Any = None) -> None:
         if not self._loop or not self.app:
@@ -2482,6 +2468,9 @@ class SettingsTab(QWidget):
         theme_line.addWidget(self.cmb_theme)
         theme_line.addStretch(1)
         root.addLayout(theme_line)
+        self.cmb_theme.setCurrentText("Sombre")
+        theme_label.setVisible(False)
+        self.cmb_theme.setVisible(False)
 
         # Section Telegram
         grp_tg = QGroupBox("Telegram")
@@ -2499,21 +2488,29 @@ class SettingsTab(QWidget):
 
         row_mode = QHBoxLayout()
         row_mode.setSpacing(8)
-        row_mode.addWidget(QLabel("Mode"))
+        self.lbl_mode = QLabel("Mode")
+        row_mode.addWidget(self.lbl_mode)
         self.cmb_mode = QComboBox()
-        self.cmb_mode.addItems(["Auto", "Polling", "Webhook"])
+        self.cmb_mode.addItems(["Polling"])
+        self.cmb_mode.setCurrentText("Polling")
         row_mode.addWidget(self.cmb_mode)
-        row_mode.addWidget(QLabel("Port"))
+        self.lbl_port = QLabel("Port")
+        row_mode.addWidget(self.lbl_port)
         self.spin_port = QSpinBox()
         self.spin_port.setRange(1, 65535)
         self.spin_port.setValue(8081)
         row_mode.addWidget(self.spin_port)
         row_mode.addStretch(1)
         tg_layout.addLayout(row_mode)
+        self.lbl_mode.setVisible(False)
+        self.cmb_mode.setVisible(False)
+        self.lbl_port.setVisible(False)
+        self.spin_port.setVisible(False)
 
         row_cookies = QHBoxLayout()
         row_cookies.setSpacing(8)
-        row_cookies.addWidget(QLabel("Cookies.txt"))
+        self.lbl_cookies = QLabel("Cookies.txt")
+        row_cookies.addWidget(self.lbl_cookies)
         self.ed_cookies = QLineEdit()
         self.ed_cookies.setPlaceholderText("Chemin vers cookies.txt (optionnel)")
         row_cookies.addWidget(self.ed_cookies, 1)
@@ -2524,14 +2521,20 @@ class SettingsTab(QWidget):
         self.btn_cookies.clicked.connect(self.on_pick_cookies)
         row_cookies.addWidget(self.btn_cookies)
         tg_layout.addLayout(row_cookies)
+        self.lbl_cookies.setVisible(False)
+        self.ed_cookies.setVisible(False)
+        self.btn_cookies.setVisible(False)
 
         row_user_agent = QHBoxLayout()
         row_user_agent.setSpacing(8)
-        row_user_agent.addWidget(QLabel("User-Agent"))
+        self.lbl_user_agent = QLabel("User-Agent")
+        row_user_agent.addWidget(self.lbl_user_agent)
         self.ed_user_agent = QLineEdit()
         self.ed_user_agent.setPlaceholderText("Mozilla/5.0 …")
         row_user_agent.addWidget(self.ed_user_agent, 1)
         tg_layout.addLayout(row_user_agent)
+        self.lbl_user_agent.setVisible(False)
+        self.ed_user_agent.setVisible(False)
 
         row_ctrl = QHBoxLayout()
         row_ctrl.setSpacing(8)
@@ -2575,6 +2578,7 @@ class SettingsTab(QWidget):
         root.addWidget(self.lab_git_hint)
 
         git_grp = QGroupBox("Git – Outils de merge")
+        self.git_grp = git_grp
         git_layout = QHBoxLayout(git_grp)
         git_layout.setContentsMargins(12, 12, 12, 12)
         git_layout.setSpacing(8)
@@ -2588,6 +2592,7 @@ class SettingsTab(QWidget):
         git_layout.addWidget(self.btn_git_abort)
         git_layout.addWidget(self.btn_git_stash_pull)
         root.addWidget(git_grp)
+        self.git_grp.setVisible(False)
 
         # Zone de logs
         self.logs = QTextEdit()
@@ -2614,20 +2619,10 @@ class SettingsTab(QWidget):
         try:
             token = cfg.get("telegram_token") or ""
             self.ed_token.setText(token)
-            mode = (cfg.get("telegram_mode") or "auto").lower()
-            nice = mode.capitalize()
-            if nice not in ("Auto", "Polling", "Webhook"):
-                nice = "Auto"
-            self.cmb_mode.setCurrentText(nice)
-            port = cfg.get("telegram_port") or DEFAULT_CONFIG["telegram_port"]
-            try:
-                self.spin_port.setValue(int(port))
-            except Exception:
-                self.spin_port.setValue(DEFAULT_CONFIG["telegram_port"])
-            cookies = cfg.get("cookies_path") or ""
-            self.ed_cookies.setText(cookies)
-            user_agent = cfg.get("user_agent") or DEFAULT_CONFIG["user_agent"]
-            self.ed_user_agent.setText(user_agent)
+            self.cmb_mode.setCurrentText("Polling")
+            self.spin_port.setValue(DEFAULT_CONFIG["telegram_port"])
+            self.ed_cookies.setText("")
+            self.ed_user_agent.setText(DEFAULT_CONFIG["user_agent"])
             self.set_telegram_idle()
         finally:
             self._loading_cfg = False
@@ -2640,16 +2635,13 @@ class SettingsTab(QWidget):
         if key == "telegram_token":
             cfg[key] = value or ""
         elif key == "telegram_mode":
-            cfg[key] = (value or "auto").lower()
+            cfg[key] = "polling"
         elif key == "telegram_port":
-            try:
-                cfg[key] = int(value)
-            except Exception:
-                cfg[key] = DEFAULT_CONFIG["telegram_port"]
+            cfg[key] = DEFAULT_CONFIG["telegram_port"]
         elif key == "cookies_path":
-            cfg[key] = value or ""
+            cfg[key] = ""
         elif key == "user_agent":
-            cfg[key] = value or DEFAULT_CONFIG["user_agent"]
+            cfg[key] = DEFAULT_CONFIG["user_agent"]
         else:
             cfg[key] = value
         save_config(cfg)
@@ -2934,15 +2926,7 @@ class Main(QWidget):
 
     # PATCH START: Telegram intégration
     def _effective_telegram_mode(self) -> str:
-        mode = (self.app_config.get("telegram_mode") or "auto").lower()
-        base = (self.app_config.get("webhook_base") or "").strip()
-        if mode == "auto":
-            return "webhook" if base else "polling"
-        if mode not in ("polling", "webhook"):
-            return "polling"
-        if mode == "webhook" and not base:
-            return "polling"
-        return mode
+        return "polling"
 
     def start_telegram(self):
         token = (self.app_config.get("telegram_token") or "").strip()
@@ -3023,7 +3007,7 @@ class Main(QWidget):
 # ---------------------- main ----------------------
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    apply_light_theme(app)  # par défaut clair ; change dans l'UI
+    apply_dark_theme(app)
     w = Main()
     w.show()
     sys.exit(app.exec())
