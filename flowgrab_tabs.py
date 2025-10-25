@@ -25,6 +25,28 @@ YOUTUBE_REGEX = re.compile(
     re.IGNORECASE,
 )
 
+
+def normalize_yt(u: str) -> str:
+    """
+    Normalise une URL YouTube :
+    - supprime le paramètre ?si=... (inutile pour yt-dlp)
+    - convertit youtu.be/<id> en https://www.youtube.com/watch?v=<id>
+    """
+    try:
+        if not u:
+            return u
+        # retire ?si=... ou &si=...
+        u = re.sub(r'([?&])si=[^&]+&?', r'\1', u)
+        u = re.sub(r'[?&]$', '', u)
+
+        m = re.search(r'youtu\.be/([A-Za-z0-9_-]{6,})', u)
+        if m:
+            vid = m.group(1)
+            return f"https://www.youtube.com/watch?v={vid}"
+        return u
+    except Exception:
+        return u
+
 # PATCH START: config persistante
 CONFIG_PATH = OUT_DIR / "flowgrab_config.json"
 
@@ -225,6 +247,8 @@ class DownloadWorker(QThread):
         self._stop = True
 
     def run(self):
+        captured = {"fn": ""}
+
         def hook(d):
             if self._stop:
                 raise Exception("Interrompu par l’utilisateur")
@@ -237,19 +261,32 @@ class DownloadWorker(QThread):
                 fn    = d.get("filename") or self.task.filename or ""
                 self.sig_progress.emit(downloaded, total, speed, eta, fn)
             elif st == "finished":
-                fn = d.get("filename", "")
-                self.sig_status.emit(f"Terminé : {fn}")
+                captured["fn"] = d.get("filename") or captured["fn"]
+                self.sig_status.emit(f"Terminé : {captured['fn']}")
 
         opts = dict(self.ydl_opts)
         opts["progress_hooks"] = [hook]
 
         try:
+            url = normalize_yt(self.task.url)
             with YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(self.task.url, download=True)
-                if info and info.get("_type") == "playlist":
-                    fn = ""
-                else:
-                    fn = ydl.prepare_filename(info)
+                info = ydl.extract_info(url, download=True)
+
+            fn = captured["fn"]
+            if not fn and info:
+                try:
+                    rd = (info.get("requested_downloads") or [])
+                    if rd:
+                        fn = rd[0].get("filepath") or rd[0].get("filename") or ""
+                except Exception:
+                    pass
+
+            if not info:
+                raise RuntimeError("yt-dlp n’a renvoyé aucune information (URL invalide, vidéo privée ou cookies requis).")
+
+            if fn:
+                self.task.filename = fn
+
             self.sig_done.emit(True, fn or "Téléchargement terminé", info or {})
         except Exception as e:
             self.sig_done.emit(False, str(e), {})
@@ -295,6 +332,7 @@ class InspectWorker(QThread):
 
     def run(self):
         try:
+            u = normalize_yt(self.url)
             ydl_opts = {
                 "quiet": True,
                 "no_warnings": True,
@@ -302,8 +340,8 @@ class InspectWorker(QThread):
                 "socket_timeout": 15,
             }
             with YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(self.url, download=False)
-            if info.get("entries"):
+                info = ydl.extract_info(u, download=False)
+            if info and info.get("entries"):
                 info = info["entries"][0]
             self.sig_done.emit(self.url, info or {})
         except Exception as e:
@@ -525,6 +563,7 @@ class TelegramWorker(QThread):
 
     # ---- yt-dlp helpers ----
     def _inspect_url(self, url: str) -> dict:
+        u = normalize_yt(url)
         ydl_opts = {
             "quiet": True,
             "no_warnings": True,
@@ -532,8 +571,8 @@ class TelegramWorker(QThread):
             "socket_timeout": 15,
         }
         with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-        if info.get("entries"):
+            info = ydl.extract_info(u, download=False)
+        if info and info.get("entries"):
             info = info["entries"][0]
         return info or {}
 
@@ -591,7 +630,7 @@ class TelegramWorker(QThread):
         if not match:
             await message.reply_text("Je n’ai pas reconnu de lien YouTube. Envoie l’URL complète.")
             return
-        url = match.group(1)
+        url = normalize_yt(match.group(1))
         await message.reply_text("Analyse du lien…")
         loop = asyncio.get_running_loop()
         try:
