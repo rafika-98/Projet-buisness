@@ -2556,7 +2556,7 @@ class SettingsTab(QWidget):
         # Ligne boutons maintenance
         line = QHBoxLayout()
         line.setSpacing(8)
-        self.btn_update = QPushButton("Mettre à jour l’app (git pull origin main)")
+        self.btn_update = QPushButton("Mettre à jour l’app (redémarrage auto)")
         icon_update = themed_icon("view-refresh", "system-software-update")
         if not icon_update.isNull():
             self.btn_update.setIcon(icon_update)
@@ -2772,23 +2772,48 @@ class SettingsTab(QWidget):
             apply_light_theme(app)
 
     def on_update_clicked(self):
+        import os, sys, subprocess, pathlib
+
         repo_root = self.find_git_root()
         if not repo_root:
             QMessageBox.warning(self, "Hors dépôt Git", "Aucun dossier '.git' trouvé en remontant depuis ce projet.")
             return
+
+        # Si un merge est en cours, on ne tente pas un pull auto
         if _is_merge_in_progress(repo_root):
-            QMessageBox.information(self, "Git", "Un merge est en cours. Utilise les outils dédiés avant de lancer git pull.")
+            QMessageBox.information(self, "Git", "Un merge est en cours. Résous-le avant de mettre à jour.")
             self.refresh_merge_state()
             return
 
-        self.append_log(f">>> cwd: {repo_root}")
+        # Localise l’updater
+        updater_py = pathlib.Path(__file__).resolve().parent / "scripts" / "updater.py"
+        if not updater_py.exists():
+            QMessageBox.warning(self, "Updater manquant", f"Fichier introuvable : {updater_py}")
+            return
 
-        def after(code: int):
-            self.on_update_done(code)
-            self.refresh_merge_state()
+        python_exe = sys.executable
+        main_script = os.path.abspath(sys.argv[0])
 
-        if not self._launch_git(["pull", "origin", "main"], repo_root, next_cb=after):
-            self.refresh_merge_state()
+        # Message utilisateur
+        QMessageBox.information(
+            self,
+            "Mise à jour",
+            "L’application va se fermer, appliquer la mise à jour (git pull) puis redémarrer automatiquement."
+        )
+
+        try:
+            subprocess.Popen(
+                [python_exe, "-u", str(updater_py), str(repo_root), python_exe, main_script],
+                close_fds=True
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "Erreur", f"Impossible de lancer l’updater : {e}")
+            return
+
+        # Ferme l'app courante pour libérer les fichiers avant le pull
+        app = QApplication.instance()
+        if app:
+            app.quit()
 
     def on_update_done(self, code: int):
         if code != 0:
