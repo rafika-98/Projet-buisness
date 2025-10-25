@@ -461,7 +461,8 @@ def estimate_size(stream: dict, duration: Optional[float]) -> Optional[float]:
 
 # ---------------------- Telegram worker ----------------------
 class TelegramWorker(QThread):
-    sig_download_requested = Signal(str, str, int, str)  # url, fmt, chat_id, title
+    # chat_id peut dépasser la taille d'un int 32 bits -> utiliser "object"
+    sig_download_requested = Signal(str, str, object, str)  # url, fmt, chat_id, title
     sig_info = Signal(str)
 
     def __init__(self, app_config: dict, parent=None):
@@ -485,19 +486,24 @@ class TelegramWorker(QThread):
             return "polling"
         return mode
 
-    def send_message(self, chat_id: int, text: str, reply_markup: Any = None) -> None:
+    def send_message(self, chat_id: int | str, text: str, reply_markup: Any = None) -> None:
         if not self._loop or not self.app:
             return
 
+        try:
+            chat_ref: int | str = int(chat_id)  # Telegram accepte les entiers Python arbitraires
+        except (TypeError, ValueError):
+            chat_ref = chat_id
+
         async def _send():
             try:
-                await self.app.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+                await self.app.bot.send_message(chat_id=chat_ref, text=text, reply_markup=reply_markup)
             except Exception as exc:
                 self.sig_info.emit(f"Envoi message Telegram impossible : {exc}")
 
         self._loop.call_soon_threadsafe(lambda: asyncio.create_task(_send()))
 
-    def ask_transcription(self, chat_id: int, audio_path: str) -> None:
+    def ask_transcription(self, chat_id: int | str, audio_path: str) -> None:
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
         try:
@@ -966,7 +972,8 @@ def delete_dir_if_empty(path: pathlib.Path):
 
 class YoutubeTab(QWidget):
     sig_request_transcription = Signal(list)
-    sig_audio_completed = Signal(int, str)  # chat_id, audio_path
+    # chat_id peut dépasser la taille d'un int 32 bits -> utiliser "object"
+    sig_audio_completed = Signal(object, str)  # chat_id, audio_path
 
     def __init__(self, app_ref, parent=None):
         super().__init__(parent)
@@ -2223,23 +2230,31 @@ class Main(QWidget):
         if self.settings_tab:
             self.settings_tab.append_telegram_info(text)
 
-    def on_tg_download_requested(self, url: str, fmt: str, chat_id: int, title: str):
+    def on_tg_download_requested(self, url: str, fmt: str, chat_id: int | str, title: str):
+        try:
+            chat_ref: int | str = int(chat_id)
+        except (TypeError, ValueError):
+            chat_ref = chat_id
         item = self.youtube_tab.append_task(url)
         task: Task = item.data(Qt.UserRole)
         task.selected_fmt = fmt
         task.source = "telegram"
-        task.chat_id = chat_id
+        task.chat_id = chat_ref
         self.youtube_tab.statusBar(f"Téléchargement demandé par Telegram — {title}")
         self.youtube_tab.start_queue()
         if self.telegram_worker:
-            self.telegram_worker.send_message(chat_id, "Téléchargement lancé…")
+            self.telegram_worker.send_message(chat_ref, "Téléchargement lancé…")
 
-    def on_audio_ready_from_youtube(self, chat_id: int, audio_path: str):
+    def on_audio_ready_from_youtube(self, chat_id: int | str, audio_path: str):
         if not self.telegram_worker:
             return
+        try:
+            chat_ref: int | str = int(chat_id)
+        except (TypeError, ValueError):
+            chat_ref = chat_id
         name = os.path.basename(audio_path) or audio_path
-        self.telegram_worker.send_message(chat_id, f"Téléchargement terminé ✅\n{name}")
-        self.telegram_worker.ask_transcription(chat_id, audio_path)
+        self.telegram_worker.send_message(chat_ref, f"Téléchargement terminé ✅\n{name}")
+        self.telegram_worker.ask_transcription(chat_ref, audio_path)
     # PATCH END
 
     def closeEvent(self, event):
