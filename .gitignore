@@ -1,0 +1,17 @@
+# Sorties & médias
+downloads/
+Videos/
+Audios/
+*.mp4
+*.mkv
+*.webm
+*.mp3
+*.m4a
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Secrets & config locale
+.env
+flowgrab_config.json
