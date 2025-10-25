@@ -462,13 +462,14 @@ def estimate_size(stream: dict, duration: Optional[float]) -> Optional[float]:
 # ---------------------- Telegram worker ----------------------
 class TelegramWorker(QThread):
     sig_download_requested = Signal(str, str, int, str)  # url, fmt, chat_id, title
-    sig_ask_transcription = Signal(int, str)              # chat_id, audio_path
     sig_info = Signal(str)
 
     def __init__(self, app_config: dict, parent=None):
         super().__init__(parent)
         self.app_config = app_config
-        self._application: "Application | None" = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._stop_evt: asyncio.Event | None = None
+        self.app: "Application | None" = None
         self._pending_choices: Dict[str, Dict[str, Any]] = {}
         self.effective_mode = self._resolve_mode()
 
@@ -484,35 +485,19 @@ class TelegramWorker(QThread):
             return "polling"
         return mode
 
-    def _submit_async(self, coro: Any) -> None:
-        app = self._application
-        if not app:
-            return
-        try:
-            app.create_task(coro)
-        except Exception:
-            loop = getattr(app, "loop", None)
-            if loop:
-                asyncio.run_coroutine_threadsafe(coro, loop)
-
     def send_message(self, chat_id: int, text: str, reply_markup: Any = None) -> None:
-        app = self._application
-        if not app:
+        if not self._loop or not self.app:
             return
 
         async def _send():
             try:
-                await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+                await self.app.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
             except Exception as exc:
                 self.sig_info.emit(f"Envoi message Telegram impossible : {exc}")
 
-        self._submit_async(_send())
+        self._loop.call_soon_threadsafe(lambda: asyncio.create_task(_send()))
 
     def ask_transcription(self, chat_id: int, audio_path: str) -> None:
-        self.sig_ask_transcription.emit(chat_id, audio_path)
-        app = self._application
-        if not app:
-            return
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
         try:
@@ -525,12 +510,10 @@ class TelegramWorker(QThread):
         encoded = quote(rel)
         name = os.path.basename(audio_path) or audio_path
         buttons = [
-            [
-                InlineKeyboardButton("Oui", callback_data=f"tr:yes:{encoded}"),
-                InlineKeyboardButton("Non", callback_data="tr:no"),
-            ]
+            [InlineKeyboardButton("📝 Oui, transcrire", callback_data=f"tr:yes:{encoded}")],
+            [InlineKeyboardButton("⛔ Non", callback_data="tr:no:")],
         ]
-        text = f"Transcrire l’audio ?\n{name}"
+        text = f"Transcrire l’audio téléchargé ?\n{name}"
         markup = InlineKeyboardMarkup(buttons)
         self.send_message(chat_id, text, markup)
 
@@ -690,8 +673,9 @@ class TelegramWorker(QThread):
             self.sig_download_requested.emit(entry.get("url", ""), fmt, chat_id, title)
             self.send_message(chat_id, f"Format sélectionné : {option.get('label','')}\nTéléchargement demandé…")
             self._pending_choices.pop(token, None)
-        elif data.startswith("tr:yes:"):
-            encoded = data[7:]
+        elif data.startswith("tr:yes"):
+            parts = data.split(":", 2)
+            encoded = parts[2] if len(parts) == 3 else ""
             token_path = unquote(encoded)
             try:
                 path_obj = pathlib.Path(token_path)
@@ -701,7 +685,7 @@ class TelegramWorker(QThread):
                 path_obj = pathlib.Path(token_path)
             audio_path = str(path_obj)
             await self._handle_transcription_yes(query, chat_id, audio_path)
-        elif data == "tr:no":
+        elif data in {"tr:no", "tr:no:"}:
             await query.answer("OK", show_alert=False)
             try:
                 await query.edit_message_reply_markup(None)
@@ -764,68 +748,151 @@ class TelegramWorker(QThread):
         if not token:
             self.sig_info.emit("Token Telegram manquant : bot non démarré.")
             return
+
+        if sys.platform.startswith("win"):
+            try:
+                asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+            except Exception:
+                pass
+
         try:
-            from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
+            self._loop = asyncio.new_event_loop()
         except Exception as exc:
-            self.sig_info.emit(f"Import python-telegram-bot impossible : {exc}")
+            self.sig_info.emit(f"Erreur bot Telegram : {exc}")
             return
 
-        mode = self.effective_mode
-        builder = Application.builder().token(token)
-        app = builder.build()
-        self._application = app
-
-        app.add_handler(CommandHandler("start", self._cmd_start))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text))
-        app.add_handler(CallbackQueryHandler(self._handle_callback))
-
-        self.sig_info.emit(f"Bot Telegram démarré en mode {mode}.")
         try:
-            if mode == "webhook":
-                base = (self.app_config.get("webhook_base") or "").rstrip("/")
-                if not base:
-                    self.sig_info.emit("URL webhook absente, bascule en mode polling.")
-                    mode = "polling"
-                    self.effective_mode = "polling"
-                else:
-                    path = f"/tg/{token}"
-                    url_path = path.lstrip("/")
-                    webhook_url = base + path
-                    port = int(self.app_config.get("telegram_port") or 8081)
-                    self.sig_info.emit(f"Webhook : {webhook_url} (port {port})")
-                    app.run_webhook(
-                        listen="0.0.0.0",
-                        port=port,
-                        url_path=url_path,
-                        webhook_url=webhook_url,
-                        drop_pending_updates=True,
-                        stop_signals=None,
-                    )
-                    return
-            app.run_polling(drop_pending_updates=True, stop_signals=None)
+            asyncio.set_event_loop(self._loop)
+            self._stop_evt = asyncio.Event()
+            mode = self._resolve_mode()
+            base = (self.app_config.get("webhook_base") or "").strip()
+            if mode == "webhook" and not base:
+                self.sig_info.emit("URL webhook absente, bascule en mode polling.")
+                mode = "polling"
+            self.effective_mode = mode
+
+            if mode == "polling":
+                self._loop.run_until_complete(self._serve_polling())
+            else:
+                port = int(self.app_config.get("telegram_port") or 8081)
+                self._loop.run_until_complete(self._serve_webhook(base, port))
         except Exception as exc:
             self.sig_info.emit(f"Erreur bot Telegram : {exc}")
         finally:
+            try:
+                if self._loop:
+                    self._loop.run_until_complete(self._shutdown())
+            except Exception:
+                pass
+            if self._loop:
+                try:
+                    self._loop.close()
+                except Exception:
+                    pass
+            self._loop = None
+            self._stop_evt = None
+            self.app = None
             self._pending_choices.clear()
-            self._application = None
-            self.sig_info.emit("Bot Telegram arrêté.")
 
-    def stop(self):
-        app = self._application
-        if not app:
+    async def _build_app(self):
+        try:
+            from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
+        except Exception as exc:
+            raise RuntimeError(f"Import python-telegram-bot impossible : {exc}") from exc
+
+        token = (self.app_config.get("telegram_token") or "").strip()
+        app = Application.builder().token(token).build()
+        self.app = app
+        app.add_handler(CommandHandler("start", self._cmd_start))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text))
+        app.add_handler(CallbackQueryHandler(self._handle_callback))
+        return app
+
+    async def _serve_polling(self):
+        self.sig_info.emit("Bot Telegram en initialisation (polling)…")
+        try:
+            app = await self._build_app()
+        except RuntimeError as exc:
+            self.sig_info.emit(str(exc))
+            return
+        await app.initialize()
+        await app.start()
+        try:
+            await app.bot.delete_webhook(drop_pending_updates=True)
+        except Exception:
+            pass
+        updater = getattr(app, "updater", None)
+        if not updater:
+            self.sig_info.emit("Impossible de démarrer le polling : updater indisponible.")
+            return
+        await updater.start_polling(drop_pending_updates=False)
+        self.sig_info.emit("Bot Telegram démarré en mode polling.")
+        if self._stop_evt:
+            await self._stop_evt.wait()
+
+    async def _serve_webhook(self, base: str, port: int):
+        self.sig_info.emit("Bot Telegram en initialisation (webhook)…")
+        try:
+            app = await self._build_app()
+        except RuntimeError as exc:
+            self.sig_info.emit(str(exc))
             return
 
-        async def _stop():
-            try:
-                await app.stop()
-            except Exception:
-                pass
-            try:
-                await app.shutdown()
-            except Exception:
-                pass
+        await app.initialize()
+        await app.start()
+        token = (self.app_config.get("telegram_token") or "").strip()
+        path = f"tg/{token}"
+        base = base.rstrip("/")
+        webhook_url = f"{base}/{path}" if base else f"/{path}"
 
-        self._submit_async(_stop())
+        try:
+            from telegram import Update
+            await app.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES)
+            await app.start_webhook(
+                listen="0.0.0.0",
+                port=port,
+                url_path=path,
+                webhook_url=webhook_url,
+                drop_pending_updates=True,
+            )
+        except Exception as exc:
+            self.sig_info.emit(f"Impossible de démarrer le webhook : {exc}")
+            return
+
+        self.sig_info.emit(f"Webhook : {webhook_url} (port {port})")
+        self.sig_info.emit("Bot Telegram démarré en mode webhook.")
+        if self._stop_evt:
+            await self._stop_evt.wait()
+
+    async def _shutdown(self):
+        app = self.app
+        self.app = None
+        if not app:
+            self.sig_info.emit("Bot Telegram arrêté.")
+            return
+        try:
+            if getattr(app, "updater", None) and app.updater.running:
+                await app.updater.stop()
+        except Exception:
+            pass
+        try:
+            await app.stop_webhook()
+        except Exception:
+            pass
+        try:
+            await app.stop()
+        except Exception:
+            pass
+        try:
+            await app.shutdown()
+        except Exception:
+            pass
+        self._pending_choices.clear()
+        self.sig_info.emit("Bot Telegram arrêté.")
+
+    def stop(self):
+        if self._loop and self._stop_evt:
+            self._loop.call_soon_threadsafe(self._stop_evt.set)
 # ---------------------- Utilitaires de fichiers ----------------------
 def _unique_path(dst: pathlib.Path) -> pathlib.Path:
     """
