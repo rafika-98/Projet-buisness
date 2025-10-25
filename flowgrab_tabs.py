@@ -1018,8 +1018,8 @@ class TelegramWorker(QThread):
             await app.bot.delete_webhook(drop_pending_updates=True)
         except Exception:
             pass
-        updater = getattr(app, "updater", None)
-        if updater is None:
+
+        if app.updater is None:
             self.sig_info.emit("Updater PTB indisponible : polling impossible.")
             try:
                 await app.stop()
@@ -1030,10 +1030,15 @@ class TelegramWorker(QThread):
             except Exception:
                 pass
             return
+
         try:
-            updater.start_polling(drop_pending_updates=False)
+            await app.updater.start_polling(drop_pending_updates=False)
         except Exception as exc:
             self.sig_info.emit(f"start_polling a échoué : {exc}")
+            try:
+                await app.updater.stop()
+            except Exception:
+                pass
             try:
                 await app.stop()
             except Exception:
@@ -1043,21 +1048,24 @@ class TelegramWorker(QThread):
             except Exception:
                 pass
             return
+
         self.sig_info.emit("Bot Telegram démarré en mode polling.")
-        if self._stop_evt:
-            await self._stop_evt.wait()
         try:
-            updater.stop()
-        except Exception:
-            pass
-        try:
-            await app.stop()
-        except Exception:
-            pass
-        try:
-            await app.shutdown()
-        except Exception:
-            pass
+            if self._stop_evt:
+                await self._stop_evt.wait()
+        finally:
+            try:
+                await app.updater.stop()
+            except Exception:
+                pass
+            try:
+                await app.stop()
+            except Exception:
+                pass
+            try:
+                await app.shutdown()
+            except Exception:
+                pass
 
     async def _serve_webhook(self, base: str, port: int):
         self.sig_info.emit("Bot Telegram en initialisation (webhook)…")
@@ -1098,20 +1106,22 @@ class TelegramWorker(QThread):
 
         self.sig_info.emit(f"Webhook : {webhook_url} (port {port})")
         self.sig_info.emit("Bot Telegram démarré en mode webhook.")
-        if self._stop_evt:
-            await self._stop_evt.wait()
         try:
-            await app.stop_webhook()
-        except Exception:
-            pass
-        try:
-            await app.stop()
-        except Exception:
-            pass
-        try:
-            await app.shutdown()
-        except Exception:
-            pass
+            if self._stop_evt:
+                await self._stop_evt.wait()
+        finally:
+            try:
+                await app.stop_webhook()
+            except Exception:
+                pass
+            try:
+                await app.stop()
+            except Exception:
+                pass
+            try:
+                await app.shutdown()
+            except Exception:
+                pass
 
     def stop(self):
         if self._loop and self._stop_evt:
