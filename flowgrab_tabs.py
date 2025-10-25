@@ -18,7 +18,7 @@ AUDIOS_DIR.mkdir(parents=True, exist_ok=True)
 TRANSCRIPTION_DIR.mkdir(parents=True, exist_ok=True)
 DOWNLOAD_ARCHIVE = OUT_DIR / "archive.txt"
 
-from typing import Optional, List, Dict, Any, TYPE_CHECKING, Callable
+from typing import Optional, List, Dict, Any, TYPE_CHECKING, Callable, Tuple
 
 if TYPE_CHECKING:  # pragma: no cover - typing uniquement
     from telegram.ext import Application
