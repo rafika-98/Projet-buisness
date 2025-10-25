@@ -33,20 +33,51 @@ YOUTUBE_REGEX = re.compile(
 BROWSER_TRY_ORDER = ("edge", "chrome", "brave", "vivaldi", "opera", "chromium", "firefox")
 
 
-def _apply_cookies_to_opts(opts: dict, cfg: dict) -> None:
-    """
-    - Si cookies.txt est présent -> l'utiliser.
-    - Sinon -> cookiesfrombrowser=(<navigateur>, None, None, None)
-    """
-    cookies = (cfg.get("cookies_path") or "").strip()
-    if cookies:
-        opts["cookiefile"] = cookies
-        opts.pop("cookiesfrombrowser", None)
+class YtdlpLogger:
+    def __init__(self, emit: Callable[[str], None]):
+        self.emit = emit
+
+    def debug(self, msg: str) -> None:  # pragma: no cover - silencieux par défaut
+        # ignorer le bruit debug de yt-dlp pour garder la console propre
         return
 
+    def warning(self, msg: str) -> None:
+        try:
+            self.emit(f"[yt-dlp] {msg}")
+        except Exception:
+            pass
+
+    def error(self, msg: str) -> None:
+        try:
+            self.emit(f"[yt-dlp] {msg}")
+        except Exception:
+            pass
+
+
+def _apply_cookies_to_opts(opts: dict, cfg: dict) -> None:
+    """Prépare les options yt-dlp selon la config courante."""
+
+    mode = (cfg.get("browser_cookies") or "auto").strip().lower()
+    cookies = (cfg.get("cookies_path") or "").strip()
+
+    opts.pop("cookiefile", None)
+    opts.pop("cookiesfrombrowser", None)
+
+    if mode == "none":
+        return
+
+    if mode == "cookiefile":
+        if cookies:
+            opts["cookiefile"] = cookies
+        return
+
+    if mode in BROWSER_TRY_ORDER:
+        opts["cookiesfrombrowser"] = (mode, None, None, None)
+        return
+
+    # mode auto : utiliser le premier navigateur de la liste, le reste sera géré via fallback
     order = _browser_fallback_order(cfg)
     browser = order[0] if order else BROWSER_TRY_ORDER[0]
-    opts.pop("cookiefile", None)
     opts["cookiesfrombrowser"] = (browser, None, None, None)
 
 
@@ -56,11 +87,22 @@ def _is_dpapi_error(exc: Exception) -> bool:
     return any(k in msg for k in needles)
 
 
+def _is_chrome_copy_error(exc: Exception) -> bool:
+    msg = (str(exc) or "").lower()
+    if not msg:
+        return False
+    return ("could not copy" in msg and "cookie" in msg and "database" in msg) or (
+        "could not copy chrome cookie database" in msg
+    )
+
+
 def _browser_fallback_order(cfg: dict) -> list[str]:
     pref = (cfg.get("browser_cookies") or "auto").strip().lower()
-    if pref != "auto":
+    if pref in BROWSER_TRY_ORDER:
         return [pref]
-    return list(BROWSER_TRY_ORDER)
+    if pref == "auto":
+        return list(BROWSER_TRY_ORDER)
+    return []
 
 
 def _ptb_major_minor() -> tuple[int, int]:
@@ -118,11 +160,13 @@ def extract_basic_info(url: str) -> dict:
         "no_warnings": True,
         "retries": 2,
         "socket_timeout": 15,
+        "logger": YtdlpLogger(lambda _: None),
     }
     if user_agent:
         base_opts["http_headers"] = {"User-Agent": user_agent}
 
     cookies_path = (cfg.get("cookies_path") or "").strip()
+    browser_pref = (cfg.get("browser_cookies") or "auto").strip().lower()
 
     def _extract(local_opts: dict[str, Any]) -> dict:
         last_exc: Exception | None = None
@@ -144,41 +188,71 @@ def extract_basic_info(url: str) -> dict:
             raise last_exc
         return {}
 
-    if cookies_path:
+    if browser_pref == "cookiefile" and cookies_path:
         legacy_opts = dict(base_opts)
         legacy_opts["cookiefile"] = cookies_path
         legacy_opts.pop("cookiesfrombrowser", None)
-        return _extract(legacy_opts)
+        try:
+            return _extract(legacy_opts)
+        except Exception:
+            # On tentera sans cookies juste après
+            pass
 
-    dpapi_failed = False
+    if browser_pref == "none":
+        opts_no_cookies = dict(base_opts)
+        opts_no_cookies.pop("cookiefile", None)
+        opts_no_cookies.pop("cookiesfrombrowser", None)
+        return _extract(opts_no_cookies)
+
     last_error: Exception | None = None
-    for browser in _browser_fallback_order(cfg):
+
+    browsers = _browser_fallback_order(cfg)
+    explicit_browser = browser_pref in BROWSER_TRY_ORDER
+    for browser in browsers:
         local_opts = dict(base_opts)
         local_opts["cookiesfrombrowser"] = (browser, None, None, None)
         try:
             return _extract(local_opts)
         except Exception as exc:
             last_error = exc
-            if _is_dpapi_error(exc):
-                dpapi_failed = True
-                continue
             msg = (str(exc) or "").lower()
-            if "pycryptodomex" in msg or "cryptodome" in msg:
-                raise RuntimeError(
-                    "Lecture des cookies Firefox impossible : installe le paquet 'pycryptodomex' (pip install pycryptodomex)."
-                )
+            if browser == "firefox" and ("pycryptodomex" in msg or "cryptodome" in msg):
+                if explicit_browser:
+                    raise RuntimeError(
+                        "Lecture des cookies Firefox impossible : installez 'pycryptodomex' (pip install pycryptodomex)."
+                    )
+                continue
+            if _is_dpapi_error(exc) or _is_chrome_copy_error(exc):
+                continue
             raise
 
-    if dpapi_failed:
+    if browser_pref == "auto" and cookies_path:
+        legacy_opts = dict(base_opts)
+        legacy_opts["cookiefile"] = cookies_path
+        legacy_opts.pop("cookiesfrombrowser", None)
+        try:
+            return _extract(legacy_opts)
+        except Exception as exc:
+            last_error = exc
+
+    # Dernier recours : sans cookies
+    opts_no_cookies = dict(base_opts)
+    opts_no_cookies.pop("cookiefile", None)
+    opts_no_cookies.pop("cookiesfrombrowser", None)
+    try:
+        return _extract(opts_no_cookies)
+    except Exception as exc:
+        # Retourner l'erreur de la dernière tentative si ce n'est pas un problème de cookies
+        if not (_is_dpapi_error(exc) or _is_chrome_copy_error(exc)):
+            raise
+        if last_error and not (_is_dpapi_error(last_error) or _is_chrome_copy_error(last_error)):
+            raise last_error
         raise RuntimeError(
-            "Impossible de lire les cookies du navigateur (échec du déchiffrement DPAPI). "
-            "Lance l’application sans privilèges administrateur, avec le même compte Windows que le navigateur, "
-            "ou force \"browser_cookies\" = \"firefox\" dans flowgrab_config.json. "
-            "Si Firefox est utilisé, installe aussi le paquet 'pycryptodomex'."
+            "Impossible de récupérer les informations vidéo : les cookies navigateur sont indisponibles et la requête sans cookies a échoué."
         )
-    if last_error:
-        raise last_error
-    raise RuntimeError("Impossible de récupérer les informations vidéo (cookies navigateur indisponibles).")
+
+    # Si aucune erreur n'a été levée, retourner un dict vide (pas censé arriver)
+    return {}
 
 # PATCH START: config persistante
 CONFIG_PATH = OUT_DIR / "flowgrab_config.json"
@@ -193,7 +267,7 @@ DEFAULT_CONFIG = {
     "telegram_port": 8081,
     "cookies_path": "",
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "browser_cookies": "auto",  # "auto" | "edge" | "chrome" | "firefox" | "brave" | "vivaldi" | "opera" | "chromium"
+    "browser_cookies": "auto",  # "auto" | navigateurs | "cookiefile" | "none"
 }
 
 
@@ -204,14 +278,19 @@ def _ensure_config_defaults(data: Optional[dict]) -> dict:
             if v is not None:
                 cfg[k] = v
 
-    # Valeurs forcées (compatibilité lecture mais écrasement silencieux)
-    cfg["telegram_mode"] = "polling"
-    cfg["telegram_port"] = DEFAULT_CONFIG["telegram_port"]
-    cfg["cookies_path"] = ""
-    cfg["user_agent"] = DEFAULT_CONFIG["user_agent"]
-
     bc = (cfg.get("browser_cookies") or "auto").strip().lower()
-    allowed = {"auto", "edge", "chrome", "firefox", "brave", "vivaldi", "opera", "chromium"}
+    allowed = {
+        "auto",
+        "edge",
+        "chrome",
+        "firefox",
+        "brave",
+        "vivaldi",
+        "opera",
+        "chromium",
+        "cookiefile",
+        "none",
+    }
     cfg["browser_cookies"] = bc if bc in allowed else "auto"
 
     return cfg
@@ -464,6 +543,9 @@ class DownloadWorker(QThread):
 
         opts = dict(self.ydl_opts)
         opts["progress_hooks"] = [hook]
+        opts["quiet"] = True
+        opts["no_warnings"] = True
+        opts["logger"] = YtdlpLogger(lambda msg: self.sig_status.emit(msg))
 
         cfg = load_config()
         user_agent = (cfg.get("user_agent") or "").strip()
@@ -472,11 +554,15 @@ class DownloadWorker(QThread):
             headers = dict(opts.get("http_headers") or {})
             headers["User-Agent"] = user_agent
             opts["http_headers"] = headers
-        _apply_cookies_to_opts(opts, cfg)
 
         try:
             url = normalize_yt(self.task.url)
             cookies_path = (cfg.get("cookies_path") or "").strip()
+            browser_pref = (cfg.get("browser_cookies") or "auto").strip().lower()
+
+            base_opts = dict(opts)
+            base_opts.pop("cookiefile", None)
+            base_opts.pop("cookiesfrombrowser", None)
 
             def _download_with_opts(local_opts: dict[str, Any]) -> tuple[dict[str, Any], int]:
                 last_exc: Exception | None = None
@@ -500,45 +586,90 @@ class DownloadWorker(QThread):
 
             info: dict[str, Any] = {}
             retcode = 0
-            dpapi_failed = False
+            dpapi_or_copy_issue = False
             last_error: Exception | None = None
+            used_no_cookies = False
+            success = False
 
-            if cookies_path:
-                legacy_opts = dict(opts)
-                legacy_opts["cookiefile"] = cookies_path
-                legacy_opts.pop("cookiesfrombrowser", None)
-                info, retcode = _download_with_opts(legacy_opts)
-                opts = legacy_opts
+            pycryptodomex_hint = "Lecture cookies Firefox impossible : installez 'pycryptodomex' (pip install pycryptodomex)."
+
+            def try_cookiefile() -> bool:
+                nonlocal info, retcode, opts, last_error
+                if not cookies_path:
+                    return False
+                local_opts = dict(base_opts)
+                local_opts["cookiefile"] = cookies_path
+                local_opts.pop("cookiesfrombrowser", None)
+                try:
+                    info, retcode = _download_with_opts(local_opts)
+                    opts = local_opts
+                    return True
+                except Exception as exc:
+                    last_error = exc
+                    return False
+
+            def try_browser(browser: str, explicit: bool) -> bool:
+                nonlocal info, retcode, opts, last_error, dpapi_or_copy_issue
+                local_opts = dict(base_opts)
+                local_opts["cookiesfrombrowser"] = (browser, None, None, None)
+                try:
+                    info, retcode = _download_with_opts(local_opts)
+                    opts = local_opts
+                    return True
+                except Exception as exc:
+                    last_error = exc
+                    msg = (str(exc) or "").lower()
+                    if browser == "firefox" and ("pycryptodomex" in msg or "cryptodome" in msg):
+                        self.sig_status.emit(pycryptodomex_hint)
+                        if explicit:
+                            raise RuntimeError(pycryptodomex_hint)
+                        return False
+                    if _is_dpapi_error(exc) or _is_chrome_copy_error(exc):
+                        dpapi_or_copy_issue = True
+                        return False
+                    raise
+
+            def try_no_cookies() -> bool:
+                nonlocal info, retcode, opts, last_error
+                local_opts = dict(base_opts)
+                local_opts.pop("cookiefile", None)
+                local_opts.pop("cookiesfrombrowser", None)
+                try:
+                    info, retcode = _download_with_opts(local_opts)
+                    opts = local_opts
+                    return True
+                except Exception as exc:
+                    last_error = exc
+                    return False
+
+            if browser_pref == "cookiefile":
+                success = try_cookiefile()
+            elif browser_pref == "none":
+                success = try_no_cookies()
+                used_no_cookies = True
             else:
-                for browser in _browser_fallback_order(cfg):
-                    local_opts = dict(opts)
-                    local_opts["cookiesfrombrowser"] = (browser, None, None, None)
-                    try:
-                        info, retcode = _download_with_opts(local_opts)
-                        opts = local_opts
+                browsers = _browser_fallback_order(cfg)
+                explicit = browser_pref in BROWSER_TRY_ORDER
+                for browser in browsers:
+                    if try_browser(browser, explicit):
+                        success = True
                         break
-                    except Exception as exc:
-                        last_error = exc
-                        if _is_dpapi_error(exc):
-                            dpapi_failed = True
-                            continue
-                        msg = (str(exc) or "").lower()
-                        if "pycryptodomex" in msg or "cryptodome" in msg:
-                            raise RuntimeError(
-                                "Lecture des cookies Firefox impossible : installe le paquet 'pycryptodomex' (pip install pycryptodomex)."
-                            )
-                        raise
-                else:
-                    if dpapi_failed:
-                        raise RuntimeError(
-                            "Impossible de lire les cookies du navigateur (échec du déchiffrement DPAPI). "
-                            "Lance l’application sans privilèges administrateur, avec le même compte Windows que le navigateur, "
-                            "ou force \"browser_cookies\" = \"firefox\" dans flowgrab_config.json. "
-                            "Si Firefox est utilisé, installe aussi le paquet 'pycryptodomex'."
-                        )
-                    if last_error:
-                        raise last_error
-                    raise RuntimeError("Téléchargement impossible : cookies navigateur indisponibles.")
+
+                if not success and browser_pref == "auto" and try_cookiefile():
+                    success = True
+
+            if not success and not used_no_cookies:
+                if dpapi_or_copy_issue:
+                    self.sig_status.emit(
+                        "Cookies navigateur indisponibles (DPAPI/DB verrouillée). Passage en mode sans cookies."
+                    )
+                success = try_no_cookies()
+                used_no_cookies = True
+
+            if not success:
+                if last_error is not None:
+                    raise last_error
+                raise RuntimeError("Téléchargement impossible : toutes les stratégies de cookies ont échoué.")
 
             fn = captured["fn"]
             if not fn and info:
@@ -2622,6 +2753,7 @@ class SettingsTab(QWidget):
         row_mode.addWidget(self.spin_port)
         row_mode.addStretch(1)
         tg_layout.addLayout(row_mode)
+
         self.lbl_mode.setVisible(False)
         self.lbl_mode.setEnabled(False)
         self.cmb_mode.setVisible(False)
@@ -2630,6 +2762,29 @@ class SettingsTab(QWidget):
         self.lbl_port.setEnabled(False)
         self.spin_port.setVisible(False)
         self.spin_port.setEnabled(False)
+
+        row_browser = QHBoxLayout()
+        row_browser.setSpacing(8)
+        self.lbl_browser_cookies = QLabel("Source cookies")
+        row_browser.addWidget(self.lbl_browser_cookies)
+        self.cmb_browser_cookies = QComboBox()
+        self._browser_combo_values: list[tuple[str, str]] = [
+            ("Auto (fallback)", "auto"),
+            ("Edge", "edge"),
+            ("Chrome", "chrome"),
+            ("Firefox", "firefox"),
+            ("Brave", "brave"),
+            ("Vivaldi", "vivaldi"),
+            ("Opera", "opera"),
+            ("Chromium", "chromium"),
+            ("cookies.txt", "cookiefile"),
+            ("Aucun (sans cookies)", "none"),
+        ]
+        for label, value in self._browser_combo_values:
+            self.cmb_browser_cookies.addItem(label, value)
+        row_browser.addWidget(self.cmb_browser_cookies, 1)
+        row_browser.addStretch(1)
+        tg_layout.addLayout(row_browser)
 
         row_cookies = QHBoxLayout()
         row_cookies.setSpacing(8)
@@ -2645,12 +2800,6 @@ class SettingsTab(QWidget):
         self.btn_cookies.clicked.connect(self.on_pick_cookies)
         row_cookies.addWidget(self.btn_cookies)
         tg_layout.addLayout(row_cookies)
-        self.lbl_cookies.setVisible(False)
-        self.lbl_cookies.setEnabled(False)
-        self.ed_cookies.setVisible(False)
-        self.ed_cookies.setEnabled(False)
-        self.btn_cookies.setVisible(False)
-        self.btn_cookies.setEnabled(False)
 
         row_user_agent = QHBoxLayout()
         row_user_agent.setSpacing(8)
@@ -2660,10 +2809,6 @@ class SettingsTab(QWidget):
         self.ed_user_agent.setPlaceholderText("Mozilla/5.0 …")
         row_user_agent.addWidget(self.ed_user_agent, 1)
         tg_layout.addLayout(row_user_agent)
-        self.lbl_user_agent.setVisible(False)
-        self.lbl_user_agent.setEnabled(False)
-        self.ed_user_agent.setVisible(False)
-        self.ed_user_agent.setEnabled(False)
 
         row_ctrl = QHBoxLayout()
         row_ctrl.setSpacing(8)
@@ -2740,7 +2885,9 @@ class SettingsTab(QWidget):
         self.spin_port.valueChanged.connect(lambda v: self._save_cfg("telegram_port", int(v)))
         self.ed_cookies.textChanged.connect(lambda s: self._save_cfg("cookies_path", s.strip()))
         self.ed_user_agent.textChanged.connect(lambda s: self._save_cfg("user_agent", s.strip()))
+        self.cmb_browser_cookies.currentIndexChanged.connect(self.on_browser_choice_changed)
 
+        self._update_cookie_inputs_state("auto")
         self.refresh_merge_state()
 
     def init_from_config(self, cfg: dict):
@@ -2749,9 +2896,19 @@ class SettingsTab(QWidget):
             token = cfg.get("telegram_token") or ""
             self.ed_token.setText(token)
             self.cmb_mode.setCurrentText("Polling")
-            self.spin_port.setValue(DEFAULT_CONFIG["telegram_port"])
-            self.ed_cookies.setText("")
-            self.ed_user_agent.setText(DEFAULT_CONFIG["user_agent"])
+            port = int(cfg.get("telegram_port") or DEFAULT_CONFIG["telegram_port"])
+            self.spin_port.setValue(port)
+            cookies_path = cfg.get("cookies_path") or ""
+            self.ed_cookies.setText(cookies_path)
+            user_agent = cfg.get("user_agent") or DEFAULT_CONFIG["user_agent"]
+            self.ed_user_agent.setText(user_agent)
+            browser_pref = (cfg.get("browser_cookies") or "auto").strip().lower()
+            idx = self.cmb_browser_cookies.findData(browser_pref)
+            if idx < 0:
+                idx = 0
+            self.cmb_browser_cookies.setCurrentIndex(idx)
+            current_mode = self.cmb_browser_cookies.currentData(Qt.UserRole) or "auto"
+            self._update_cookie_inputs_state(str(current_mode))
             self.set_telegram_idle()
         finally:
             self._loading_cfg = False
@@ -2764,16 +2921,32 @@ class SettingsTab(QWidget):
         if key == "telegram_token":
             cfg[key] = value or ""
         elif key == "telegram_mode":
-            cfg[key] = "polling"
+            cfg[key] = value or "polling"
         elif key == "telegram_port":
-            cfg[key] = DEFAULT_CONFIG["telegram_port"]
+            cfg[key] = int(value)
         elif key == "cookies_path":
-            cfg[key] = ""
+            cfg[key] = value or ""
         elif key == "user_agent":
-            cfg[key] = DEFAULT_CONFIG["user_agent"]
+            cfg[key] = value or ""
+        elif key == "browser_cookies":
+            cfg[key] = value or "auto"
         else:
             cfg[key] = value
         save_config(cfg)
+
+    def on_browser_choice_changed(self):
+        mode = self.cmb_browser_cookies.currentData(Qt.UserRole) or "auto"
+        self._update_cookie_inputs_state(str(mode))
+        if self._loading_cfg:
+            return
+        self._save_cfg("browser_cookies", str(mode))
+
+    def _update_cookie_inputs_state(self, mode: str) -> None:
+        enable_cookie_file = mode == "cookiefile"
+        for widget in (self.lbl_cookies, self.ed_cookies, self.btn_cookies):
+            widget.setEnabled(enable_cookie_file)
+        # garder les champs visibles mais verrouillés si non pertinents
+        self.ed_cookies.setReadOnly(not enable_cookie_file)
 
     def set_telegram_running(self, mode: str):
         self.lab_tg.setText(f"Bot : en cours ({mode})")
