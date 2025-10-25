@@ -159,9 +159,11 @@ def load_config() -> dict:
 
 def save_config(cfg: dict) -> None:
     try:
-        import json, datetime
+        import json
+        from datetime import datetime, timezone
+
         merged = _ensure_config_defaults(cfg)
-        merged["last_updated"] = datetime.datetime.utcnow().isoformat() + "Z"
+        merged["last_updated"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         CONFIG_PATH.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
         pass
@@ -187,6 +189,12 @@ from PySide6.QtWidgets import (
     QSpinBox,
 )
 from PySide6.QtWidgets import QTextEdit
+
+try:
+    from shiboken6 import isValid as _shiboken_is_valid
+except Exception:  # pragma: no cover - fallback si shiboken6 absent
+    def _shiboken_is_valid(obj):  # type: ignore[return-type]
+        return obj is not None
 
 try:
     from flask import Flask
@@ -225,6 +233,13 @@ def _send_windows_notification(message: str) -> None:
         ], creationflags=creationflags)
     except Exception:
         pass
+
+
+def _is_list_item_valid(item: Optional[QListWidgetItem]) -> bool:
+    try:
+        return bool(item) and _shiboken_is_valid(item)
+    except Exception:
+        return False
 
 
 def start_notification_server(parent_widget=None) -> None:
@@ -1518,6 +1533,18 @@ class YoutubeTab(QWidget):
         self.list.addItem(item)
         return item
 
+    def find_item_for_task(self, task: Task) -> Optional[QListWidgetItem]:
+        for idx in range(self.list.count()):
+            candidate = self.list.item(idx)
+            if candidate and candidate.data(Qt.UserRole) is task:
+                return candidate
+        return None
+
+    def _ensure_task_item(self, item: Optional[QListWidgetItem], task: Task) -> Optional[QListWidgetItem]:
+        if _is_list_item_valid(item):
+            return item
+        return self.find_item_for_task(task)
+
     def add_url(self):
         url = self.edit_url.text().strip()
         if not url:
@@ -1810,13 +1837,15 @@ class YoutubeTab(QWidget):
 
         _, item, task = next_task
         task.status = "En cours"
-        item.setText(f"[En cours] {task.url}")
+        safe_item = self._ensure_task_item(item, task)
+        if _is_list_item_valid(safe_item):
+            safe_item.setText(f"[En cours] {task.url}")
 
         opts = self.build_opts(task)
         self.current_worker = DownloadWorker(task, opts, self)
-        self.current_worker.sig_progress.connect(lambda d, tot, sp, eta, fn: self.on_progress(item, task, d, tot, sp, eta, fn))
+        self.current_worker.sig_progress.connect(lambda d, tot, sp, eta, fn: self.on_progress(safe_item, task, d, tot, sp, eta, fn))
         self.current_worker.sig_status.connect(self.statusBar)
-        self.current_worker.sig_done.connect(lambda ok, msg, info: self.on_done(item, task, ok, msg, info))
+        self.current_worker.sig_done.connect(lambda ok, msg, info: self.on_done(safe_item, task, ok, msg, info))
         self.btn_start.setEnabled(False)
         self.current_worker.start()
 
@@ -1835,13 +1864,17 @@ class YoutubeTab(QWidget):
         self.lab_speed.setText(f"Vitesse : {human_rate(speed)}")
         self.lab_size.setText(f"Taille : {human_size(downloaded)} / {human_size(total)}")
         self.lab_eta.setText(f"ETA : {human_eta(eta)}")
-        item.setText(f"[{pct:>3}%] {task.url}")
+        safe_item = self._ensure_task_item(item, task)
+        if _is_list_item_valid(safe_item):
+            safe_item.setText(f"[{pct:>3}%] {task.url}")
 
     @Slot()
     def on_done(self, item: QListWidgetItem, task: Task, ok: bool, msg: str, info: dict):
+        safe_item = self._ensure_task_item(item, task)
         if ok:
             task.status = "Terminé"
-            item.setText(f"[Terminé] {task.url}")
+            if _is_list_item_valid(safe_item):
+                safe_item.setText(f"[Terminé] {task.url}")
             self.statusBar(f"Terminé : {msg}")
             task.video_id = (info or {}).get("id")
             moved = move_final_outputs(task)
@@ -1871,7 +1904,8 @@ class YoutubeTab(QWidget):
                     self.sig_request_transcription.emit([audio_path])
         else:
             task.status = "Erreur"
-            item.setText(f"[Erreur] {task.url}")
+            if _is_list_item_valid(safe_item):
+                safe_item.setText(f"[Erreur] {task.url}")
             if task.source == "telegram" and task.chat_id:
                 main = self.window()
                 worker = getattr(main, "telegram_worker", None)
