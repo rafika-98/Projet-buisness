@@ -5,7 +5,6 @@ import threading
 import asyncio
 import secrets
 import re
-from urllib.parse import quote, unquote
 
 OUT_DIR = pathlib.Path(r"C:\Users\Lamine\Desktop\Projet final\Application\downloads")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -545,6 +544,8 @@ class TelegramWorker(QThread):
         self.app: "Application | None" = None
         self._pending_choices: Dict[str, Dict[str, Any]] = {}
         self.effective_mode = self._resolve_mode()
+        # Map token -> chemin audio à transcrire (évite de dépasser la limite Telegram 64o sur callback_data)
+        self._pending_transcriptions: Dict[str, str] = {}
 
     # ---- helpers ----
     def _resolve_mode(self) -> str:
@@ -578,22 +579,14 @@ class TelegramWorker(QThread):
     def ask_transcription(self, chat_id: int | str, audio_path: str) -> None:
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-        try:
-            rel = os.path.relpath(audio_path, OUT_DIR)
-            if rel.startswith(".."):
-                rel = audio_path
-        except Exception:
-            rel = audio_path
-        rel = rel.replace("\\", "/")
-        encoded = quote(rel)
+        token = secrets.token_urlsafe(8)  # court, sûr, << 64 octets
+        self._pending_transcriptions[token] = audio_path
         name = os.path.basename(audio_path) or audio_path
         buttons = [
-            [InlineKeyboardButton("📝 Oui, transcrire", callback_data=f"tr:yes:{encoded}")],
-            [InlineKeyboardButton("⛔ Non", callback_data="tr:no:")],
+            [InlineKeyboardButton("📝 Oui, transcrire", callback_data=f"tr:yes:{token}")],
+            [InlineKeyboardButton("⛔ Non", callback_data=f"tr:no:{token}")],
         ]
-        text = f"Transcrire l’audio téléchargé ?\n{name}"
-        markup = InlineKeyboardMarkup(buttons)
-        self.send_message(chat_id, text, markup)
+        self.send_message(chat_id, f"Transcrire l’audio téléchargé ?\n{name}", InlineKeyboardMarkup(buttons))
 
     # ---- yt-dlp helpers ----
     def _inspect_url(self, url: str) -> dict:
@@ -754,17 +747,13 @@ class TelegramWorker(QThread):
             self._pending_choices.pop(token, None)
         elif data.startswith("tr:yes"):
             parts = data.split(":", 2)
-            encoded = parts[2] if len(parts) == 3 else ""
-            token_path = unquote(encoded)
-            try:
-                path_obj = pathlib.Path(token_path)
-                if not path_obj.is_absolute():
-                    path_obj = (OUT_DIR / token_path).resolve()
-            except Exception:
-                path_obj = pathlib.Path(token_path)
-            audio_path = str(path_obj)
+            tok = parts[2] if len(parts) == 3 else ""
+            audio_path = self._pending_transcriptions.pop(tok, "")
+            if not audio_path:
+                await query.answer("Lien expiré. Renvoie la vidéo pour réessayer.", show_alert=True)
+                return
             await self._handle_transcription_yes(query, chat_id, audio_path)
-        elif data in {"tr:no", "tr:no:"}:
+        elif data.startswith("tr:no"):
             await query.answer("OK", show_alert=False)
             try:
                 await query.edit_message_reply_markup(None)
@@ -1054,7 +1043,7 @@ def move_final_outputs(task: Task) -> dict:
                 except Exception:
                     shutil.move(str(p), str(dst))
                 moved["video"] = str(dst)
-            elif ext == ".mp3":
+            elif ext in (".mp3", ".m4a", ".wav", ".ogg", ".flac"):
                 dst = _unique_path(AUDIOS_DIR / p.name)
                 try:
                     p.replace(dst)
