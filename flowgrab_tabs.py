@@ -257,16 +257,40 @@ def start_notification_server(parent_widget=None) -> None:
         if request.args.get("token") != TOKEN:
             return {"status": "forbidden"}, 403
 
-        def _purge_transcription_segments():
+        def _purge_transcription_segments_and_audio():
             try:
-                if not TRANSCRIPTION_DIR.exists():
-                    return
-                for p in TRANSCRIPTION_DIR.glob("audio_partie_*.aac"):
-                    try:
-                        if p.is_file():
-                            p.unlink()
-                    except Exception:
-                        pass
+                if TRANSCRIPTION_DIR.exists():
+                    for p in TRANSCRIPTION_DIR.glob("audio_partie_*.aac"):
+                        try:
+                            if p.is_file():
+                                p.unlink()
+                        except Exception:
+                            pass
+                    for p in TRANSCRIPTION_DIR.glob("*.mp3"):
+                        try:
+                            if p.is_file():
+                                p.unlink()
+                        except Exception:
+                            pass
+
+                horizon = time.time() - 3600
+                if AUDIOS_DIR.exists():
+                    for p in AUDIOS_DIR.iterdir():
+                        if not p.is_file():
+                            continue
+                        if p.suffix.lower() not in {".mp3", ".m4a", ".wav", ".ogg", ".flac"}:
+                            continue
+                        try:
+                            stat = p.stat()
+                        except Exception:
+                            continue
+                        if stat.st_size <= 0:
+                            continue
+                        if stat.st_mtime >= horizon:
+                            try:
+                                p.unlink()
+                            except Exception:
+                                pass
             except Exception:
                 pass
 
@@ -279,7 +303,7 @@ def start_notification_server(parent_widget=None) -> None:
             QMessageBox.information(parent, "Notification N8N", "La transcription est terminée.")
 
         QTimer.singleShot(0, show_message_box)
-        QTimer.singleShot(0, _purge_transcription_segments)
+        QTimer.singleShot(0, _purge_transcription_segments_and_audio)
         threading.Thread(target=_send_windows_notification, args=("La transcription est terminée.",), daemon=True).start()
         return {"status": "ok"}
 
@@ -890,18 +914,6 @@ class TelegramWorker(QThread):
         if status == 0:
             self.send_message(chat_id, f"Transcription impossible : {body}")
             return
-        if 200 <= status < 300:
-            base_dir = AUDIOS_DIR.resolve()
-            try:
-                resolved = pathlib.Path(audio_path).resolve()
-            except Exception:
-                resolved = None
-            if resolved and _is_path_in_dir(resolved, base_dir):
-                try:
-                    if resolved.exists():
-                        resolved.unlink()
-                except Exception:
-                    pass
         snippet = body.strip()
         if len(snippet) > 400:
             snippet = snippet[:400] + "\n...[tronqué]..."
@@ -1006,8 +1018,20 @@ class TelegramWorker(QThread):
             await app.bot.delete_webhook(drop_pending_updates=True)
         except Exception:
             pass
+        updater = getattr(app, "updater", None)
+        if updater is None:
+            self.sig_info.emit("Updater PTB indisponible : polling impossible.")
+            try:
+                await app.stop()
+            except Exception:
+                pass
+            try:
+                await app.shutdown()
+            except Exception:
+                pass
+            return
         try:
-            await app.start_polling(drop_pending_updates=False)
+            updater.start_polling(drop_pending_updates=False)
         except Exception as exc:
             self.sig_info.emit(f"start_polling a échoué : {exc}")
             try:
@@ -1022,6 +1046,10 @@ class TelegramWorker(QThread):
         self.sig_info.emit("Bot Telegram démarré en mode polling.")
         if self._stop_evt:
             await self._stop_evt.wait()
+        try:
+            updater.stop()
+        except Exception:
+            pass
         try:
             await app.stop()
         except Exception:
@@ -2160,7 +2188,6 @@ class TranscriptionTab(QWidget):
         self.last_dir: str | None = None
         self._updating_url = False
         self._webhook_path = "/webhook/Audio"
-        self._pending_delete: list[str] = []
         self.build_ui()
         self.update_send_button()
 
@@ -2296,7 +2323,6 @@ class TranscriptionTab(QWidget):
             return
 
         self.btn_send.setEnabled(False)
-        self._pending_delete = files[:]
         self.worker = MultiUploadWorker(url, files, self)
         self.worker.sig_log.connect(self.logs.append)
         self.worker.sig_done.connect(self.on_sent_done)
@@ -2311,26 +2337,12 @@ class TranscriptionTab(QWidget):
         self.update_send_button()
         if ok:
             QMessageBox.information(self, "OK", "Tous les envois ont réussi.")
-            base_dir = AUDIOS_DIR.resolve()
-            for path in self._pending_delete:
-                try:
-                    resolved = pathlib.Path(path).resolve()
-                except Exception:
-                    continue
-                if not _is_path_in_dir(resolved, base_dir):
-                    continue
-                try:
-                    if resolved.exists():
-                        resolved.unlink()
-                except Exception:
-                    pass
         else:
             QMessageBox.warning(
                 self,
                 "Terminé avec erreurs",
                 "Au moins un fichier a échoué. Consulte les logs pour les détails.",
             )
-        self._pending_delete = []
 
     def clear_selection_and_logs(self):
         self.selected_paths.clear()
