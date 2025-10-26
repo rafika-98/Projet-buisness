@@ -17,6 +17,7 @@ VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
 AUDIOS_DIR.mkdir(parents=True, exist_ok=True)
 TRANSCRIPTION_DIR.mkdir(parents=True, exist_ok=True)
 DOWNLOAD_ARCHIVE = OUT_DIR / "archive.txt"
+DOWNLOAD_ARCHIVE_TT = OUT_DIR / "archive_tiktok.txt"
 
 from typing import Optional, List, Dict, Any, TYPE_CHECKING, Callable, Tuple
 
@@ -27,6 +28,11 @@ import telegram as tg  # pour la version
 
 YOUTUBE_REGEX = re.compile(
     r"(https?://(?:www\.)?(?:youtube\.com/watch\?\S*?v=[^\s&]+|youtu\.be/[^\s/?#]+)[^\s]*)",
+    re.IGNORECASE,
+)
+
+TIKTOK_REGEX = re.compile(
+    r"(https?://(?:www\.)?(?:tiktok\.com/.+?/video/\d+|vt\.tiktok\.com/\S+|vm\.tiktok\.com/\S+))",
     re.IGNORECASE,
 )
 
@@ -142,6 +148,34 @@ def normalize_yt(u: str) -> str:
         return u
 
 
+def normalize_tiktok(u: str) -> str:
+    """
+    Normalise une URL TikTok :
+    - supprime certains paramètres marketing courants
+    - laisse les liens courts (vm./vt.) tels quels (yt-dlp gère la redirection)
+    """
+    try:
+        if not u:
+            return u
+        # retire paramètres bruyants (_r, _t, share_link_id, etc.)
+        u = re.sub(r'([?&])(?:_r|_t|share_link_id|sender_device)=\w+&?', r'\1', u)
+        u = re.sub(r'[?&]$', '', u)
+        return u
+    except Exception:
+        return u
+
+
+def normalize_url(u: str) -> str:
+    if not u:
+        return u
+    low = u.lower()
+    if "youtu" in low:
+        return normalize_yt(u)
+    if "tiktok.com" in low or "vm.tiktok.com" in low or "vt.tiktok.com" in low:
+        return normalize_tiktok(u)
+    return u
+
+
 def _is_path_in_dir(candidate: pathlib.Path, directory: pathlib.Path) -> bool:
     try:
         candidate.relative_to(directory)
@@ -152,7 +186,7 @@ def _is_path_in_dir(candidate: pathlib.Path, directory: pathlib.Path) -> bool:
 
 def extract_basic_info(url: str) -> dict:
     """Récupère les métadonnées d'une vidéo sans lancer de téléchargement."""
-    u = normalize_yt(url)
+    u = normalize_url(url)
     cfg = load_config()
     user_agent = (cfg.get("user_agent") or DEFAULT_CONFIG["user_agent"]).strip()
     base_opts: dict[str, Any] = {
@@ -556,7 +590,7 @@ class DownloadWorker(QThread):
             opts["http_headers"] = headers
 
         try:
-            url = normalize_yt(self.task.url)
+            url = normalize_url(self.task.url)
             cookies_path = (cfg.get("cookies_path") or "").strip()
             browser_pref = (cfg.get("browser_cookies") or "auto").strip().lower()
 
@@ -2223,6 +2257,102 @@ class YoutubeTab(QWidget):
                 pass
 
 
+class TikTokTab(YoutubeTab):
+    """
+    Onglet TikTok : même logique que YoutubeTab, mais détection d'URL TikTok,
+    format par défaut adapté, et archive dédiée.
+    """
+
+    def build_ui(self):
+        super().build_ui()
+        # Ajuster juste le placeholder d’entrée pour clarifier au user
+        self.edit_url.setPlaceholderText("Colle une URL TikTok et presse Entrée pour l’ajouter")
+
+    # --- Détection d'URL (TikTok) ---
+    def add_url(self):
+        url = self.edit_url.text().strip()
+        if not url:
+            return
+        # Détection TikTok
+        m = TIKTOK_REGEX.search(url)
+        if not m:
+            QMessageBox.information(self, "URL invalide", "Cette URL ne semble pas être une URL TikTok.")
+            return
+        url = m.group(1)
+        # Éviter doublons
+        for i in range(self.list.count()):
+            exist_task: Task = self.list.item(i).data(Qt.UserRole)
+            if exist_task and exist_task.url == url:
+                QMessageBox.information(self, "Déjà présent", "Cette URL est déjà dans la liste.")
+                self.edit_url.clear()
+                return
+        item = self.append_task(url)
+        self.list.setCurrentItem(item)
+        self.inspect_task_async(item)
+        self.edit_url.clear()
+
+    def paste_clipboard(self):
+        cb = QApplication.clipboard()
+        if not cb:
+            return
+        text = (cb.text() or "").strip()
+        if not text:
+            return
+        match = TIKTOK_REGEX.search(text)
+        if match:
+            self.edit_url.setText(match.group(1))
+            self.add_url()
+
+    def dropEvent(self, e):
+        urls: list[str] = []
+        if e.mimeData().hasUrls():
+            for url in e.mimeData().urls():
+                path = url.toLocalFile() or url.toString()
+                if path:
+                    urls.append(path)
+        if e.mimeData().hasText():
+            urls.append(e.mimeData().text())
+        for raw in urls:
+            if not raw:
+                continue
+            match = TIKTOK_REGEX.search(raw.strip())
+            if match:
+                self.edit_url.setText(match.group(1))
+                self.add_url()
+        e.acceptProposedAction()
+
+    # --- Options yt-dlp spécifiques TikTok ---
+    def build_opts(self, task: Task):
+        outdir = OUT_DIR
+        # Sur TikTok, la vidéo arrive souvent déjà muxée (mp4); fallback "best"
+        fmt = task.selected_fmt or "best[ext=mp4]/best"
+
+        folder_tmpl = "%(title).200s [%(id)s]"
+        file_tmpl = "%(title).200s [%(id)s].%(ext)s"
+        outtmpl = str(outdir / folder_tmpl / file_tmpl)
+
+        opts = {
+            "outtmpl": outtmpl,
+            "windowsfilenames": True,
+            "format": fmt,
+            "merge_output_format": "mp4",
+            "postprocessors": [
+                {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"},
+                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
+            ],
+            "keepvideo": True,  # on garde la vidéo après extraction mp3
+            "quiet": True,
+            "no_warnings": True,
+            "continuedl": True,
+            "concurrent_fragment_downloads": 4,
+            "noplaylist": True,
+            "download_archive": str(DOWNLOAD_ARCHIVE_TT),  # archive séparée
+            "nooverwrites": True,
+            "overwrites": False,
+        }
+        return opts
+
+
 class ServeurTab(QWidget):
     """Onglet très simple avec deux boutons : Allumer / Éteindre.
     Allumer => lance PowerShell avec le script (cloudflared + n8n).
@@ -3211,14 +3341,15 @@ class Main(QWidget):
         self.telegram_worker: TelegramWorker | None = None
 
         self.youtube_tab = YoutubeTab(app_ref=QApplication.instance())
+        self.tiktok_tab = TikTokTab(app_ref=QApplication.instance())
         self.transcription_tab = TranscriptionTab()
         self.serveur_tab = ServeurTab()
         self.settings_tab = SettingsTab(app_ref=self)
 
         tabs = QTabWidget()
         tabs.addTab(self.youtube_tab, "YouTube")
+        tabs.addTab(self.tiktok_tab, "TikTok")
         tabs.addTab(self.transcription_tab, "Transcription")
-        tabs.addTab(ComingSoonTab("À venir 2"), "À venir 2")
         tabs.addTab(ComingSoonTab("À venir 3"), "À venir 3")
         tabs.addTab(ComingSoonTab("À venir 4"), "À venir 4")
         tabs.addTab(self.settings_tab, "Paramètres généraux")
@@ -3234,6 +3365,8 @@ class Main(QWidget):
         self.serveur_tab.sig_public_url.connect(self.on_cloudflare_public_url)       # base
         self.youtube_tab.sig_request_transcription.connect(self.on_transcription_request)
         self.youtube_tab.sig_audio_completed.connect(self.on_audio_ready_from_youtube)
+        self.tiktok_tab.sig_request_transcription.connect(self.on_transcription_request)
+        self.tiktok_tab.sig_audio_completed.connect(self.on_audio_ready_from_youtube)
         self.transcription_tab.sig_url_changed.connect(self.on_transcription_url_changed)
 
         # Paramètres Telegram
