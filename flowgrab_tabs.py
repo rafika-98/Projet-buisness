@@ -1527,7 +1527,17 @@ def move_final_outputs(task: Task) -> dict:
             if not p.is_file():
                 continue
             ext = p.suffix.lower()
-            if ext not in (".mp4", ".mp3", ".m4a", ".wav", ".ogg", ".flac", ".aac", ".mkv", ".webm"):
+
+            # ⛔ 1) Ne PAS déplacer les flux audio bruts (intermédiaires)
+            if ext in {".m4a", ".aac", ".wav", ".ogg", ".flac"}:
+                continue
+
+            # ⛔ 2) Ne PAS déplacer les .mp4 intermédiaires (.fNNN.mp4)
+            if ext == ".mp4" and ".f" in p.stem:
+                continue
+
+            # ✅ 3) On ne s'occupe que des fichiers finaux utiles
+            if ext not in (".mp4", ".mp3", ".mkv", ".webm", ".mov"):
                 continue
 
             stem = p.stem
@@ -1538,12 +1548,13 @@ def move_final_outputs(task: Task) -> dict:
                 if start >= 0 and end > start:
                     token_segment = stem[start : end + 1]
 
-            base_dir = AUDIOS_DIR
-            if ext == ".mp4" and ".f" not in stem:
-                base_dir = VIDEOS_DIR
-            elif ext in (".mkv", ".webm"):
+            # Dossier cible (audios vs vidéos)
+            if ext == ".mp3":
+                base_dir = AUDIOS_DIR
+            else:
                 base_dir = VIDEOS_DIR
 
+            # Construction d'un nom sûr et stable
             prefix = stem
             if token_segment:
                 prefix = stem.replace(token_segment, "").strip()
@@ -1554,6 +1565,7 @@ def move_final_outputs(task: Task) -> dict:
                 safe_stem = safe_prefix
             safe_name = f"{safe_stem}{ext}"
             dst = _unique_path(base_dir / safe_name)
+
             try:
                 p.replace(dst)
             except Exception:
@@ -1568,6 +1580,25 @@ def move_final_outputs(task: Task) -> dict:
     except Exception:
         pass
     return moved
+
+
+def cleanup_orphans_in_outputs(task: Task):
+    """Supprime des sorties finales les fichiers intermédiaires orphelins déjà déplacés par erreur."""
+    if not task.video_id:
+        return
+    token = f"[{task.video_id}]"
+    try:
+        for p in AUDIOS_DIR.glob(f"*{token}*"):
+            if not p.is_file():
+                continue
+            ext = p.suffix.lower()
+            if ext == ".m4a" or (ext == ".mp4" and ".f" in p.stem) or ext in {".aac", ".wav", ".ogg", ".flac"}:
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 def delete_dir_if_empty(path: pathlib.Path):
@@ -2114,6 +2145,7 @@ class YoutubeTab(QWidget):
             task.video_id = (info or {}).get("id")
             moved = move_final_outputs(task)
             self.cleanup_residuals(task)
+            cleanup_orphans_in_outputs(task)
             try:
                 if task.filename:
                     subdir = OUT_DIR / pathlib.Path(task.filename).parent.name
