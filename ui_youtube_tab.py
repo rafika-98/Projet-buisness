@@ -38,10 +38,10 @@ from download_core import (
     list_video_formats,
     move_final_outputs,
     pick_best_audio,
-    YOUTUBE_REGEX,
-    TIKTOK_REGEX,
 )
-from paths import DOWNLOAD_ARCHIVE, DOWNLOAD_ARCHIVE_TT, delete_dir_if_empty
+from module_tiktok import TIKTOK_REGEX, build_download_options as build_tiktok_options
+from module_youtube import YOUTUBE_REGEX, build_download_options as build_youtube_options
+from paths import delete_dir_if_empty, get_video_dir
 
 
 class InspectWorker(QThread):
@@ -84,10 +84,11 @@ class YoutubeTab(QWidget):
     sig_request_transcription = Signal(list)
     sig_audio_completed = Signal(object, str)
 
-    def __init__(self, app_ref, parent=None):
+    def __init__(self, app_ref, parent=None, platform: str = "youtube"):
         super().__init__(parent)
         self.setAcceptDrops(True)
         self.app_ref = app_ref
+        self.platform = (platform or "youtube").lower()
         self.queue: List[Task] = []
         self.current_worker: Optional[DownloadWorker] = None
         self.last_inspect_info: Dict[str, Any] = {}
@@ -237,14 +238,18 @@ class YoutubeTab(QWidget):
         self.setMinimumWidth(1080)
 
     def open_output_dir(self) -> None:
-        self._open_dir(OUT_DIR)
+        try:
+            target = get_video_dir(self.platform)
+        except Exception:
+            target = OUT_DIR
+        self._open_dir(target)
 
     def clear_url_list(self) -> None:
         self.queue.clear()
         self.list.clear()
 
     def append_task(self, url: str) -> QListWidgetItem:
-        task = Task(url=url)
+        task = Task(url=url, platform=self.platform)
         self.queue.append(task)
         item = QListWidgetItem(f"[En attente] {url}")
         item.setData(Qt.UserRole, task)
@@ -487,32 +492,7 @@ class YoutubeTab(QWidget):
         self.statusBar(f"Format choisi : {chosen}")
 
     def build_opts(self, task: Task) -> dict:
-        outdir = OUT_DIR
-        fmt = task.selected_fmt or "bestvideo[ext=mp4][vcodec*=avc1]+bestaudio[ext=m4a]/best[ext=mp4]"
-
-        folder_tmpl = "%(title).200s [%(id)s]"
-        file_tmpl = "%(title).200s [%(id)s].%(ext)s"
-        outtmpl = str(outdir / folder_tmpl / file_tmpl)
-
-        return {
-            "outtmpl": outtmpl,
-            "windowsfilenames": True,
-            "format": fmt,
-            "merge_output_format": "mp4",
-            "postprocessors": [
-                {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"},
-                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
-            ],
-            "keepvideo": True,
-            "quiet": True,
-            "no_warnings": True,
-            "continuedl": True,
-            "concurrent_fragment_downloads": 4,
-            "noplaylist": True,
-            "download_archive": str(DOWNLOAD_ARCHIVE),
-            "nooverwrites": True,
-            "overwrites": False,
-        }
+        return build_youtube_options(task)
 
     def start_queue(self) -> None:
         if self.list.count() == 0 and self.edit_url.text().strip():
@@ -668,6 +648,9 @@ class YoutubeTab(QWidget):
 
 
 class TikTokTab(YoutubeTab):
+    def __init__(self, app_ref, parent=None):
+        super().__init__(app_ref, parent, platform="tiktok")
+
     def build_ui(self) -> None:
         super().build_ui()
         self.edit_url.setPlaceholderText("Colle une URL TikTok et presse Entrée pour l’ajouter")
@@ -723,29 +706,4 @@ class TikTokTab(YoutubeTab):
         event.acceptProposedAction()
 
     def build_opts(self, task: Task) -> dict:
-        outdir = OUT_DIR
-        fmt = task.selected_fmt or "best[ext=mp4]/best"
-
-        folder_tmpl = "%(title).200s [%(id)s]"
-        file_tmpl = "%(title).200s [%(id)s].%(ext)s"
-        outtmpl = str(outdir / folder_tmpl / file_tmpl)
-
-        return {
-            "outtmpl": outtmpl,
-            "windowsfilenames": True,
-            "format": fmt,
-            "merge_output_format": "mp4",
-            "postprocessors": [
-                {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"},
-                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
-            ],
-            "keepvideo": True,
-            "quiet": True,
-            "no_warnings": True,
-            "continuedl": True,
-            "concurrent_fragment_downloads": 4,
-            "noplaylist": True,
-            "download_archive": str(DOWNLOAD_ARCHIVE_TT),
-            "nooverwrites": True,
-            "overwrites": False,
-        }
+        return build_tiktok_options(task)
