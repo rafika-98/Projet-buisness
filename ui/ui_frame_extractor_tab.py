@@ -91,6 +91,18 @@ class FrameExtractorTab(QWidget):
 
         root.addWidget(video_box)
 
+        toggles_layout = QHBoxLayout()
+        toggles_layout.setSpacing(12)
+        toggles_layout.addWidget(QLabel("Afficher :"))
+        self.chk_show_output_box = QCheckBox("Dossier de sortie")
+        self.chk_show_options_box = QCheckBox("Options")
+        self.chk_show_logs_box = QCheckBox("Journal")
+        toggles_layout.addWidget(self.chk_show_output_box)
+        toggles_layout.addWidget(self.chk_show_options_box)
+        toggles_layout.addWidget(self.chk_show_logs_box)
+        toggles_layout.addStretch(1)
+        root.addLayout(toggles_layout)
+
         output_box = QGroupBox("Dossier de sortie")
         output_layout = QHBoxLayout(output_box)
         output_layout.setContentsMargins(12, 12, 12, 12)
@@ -205,7 +217,7 @@ class FrameExtractorTab(QWidget):
         self.preview.setStyleSheet("border: 1px solid #444; background: #111; color: #888;")
         progress_layout.addWidget(self.preview)
 
-        root.addWidget(progress_box)
+        root.addWidget(progress_box, 1)
 
         logs_box = QGroupBox("Journal")
         logs_layout = QVBoxLayout(logs_box)
@@ -215,6 +227,14 @@ class FrameExtractorTab(QWidget):
         self.logs.setReadOnly(True)
         logs_layout.addWidget(self.logs)
         root.addWidget(logs_box)
+
+        self.chk_show_output_box.toggled.connect(output_box.setVisible)
+        self.chk_show_options_box.toggled.connect(options_box.setVisible)
+        self.chk_show_logs_box.toggled.connect(logs_box.setVisible)
+
+        output_box.setVisible(False)
+        options_box.setVisible(False)
+        logs_box.setVisible(False)
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
