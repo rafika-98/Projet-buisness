@@ -56,8 +56,13 @@ class FrameExtractorTab(QWidget):
         self._last_video_dir: Optional[str] = None
         self._last_output_dir: Optional[str] = None
         self._current_output_dir: Optional[pathlib.Path] = None
+        self._default_output_dir = pathlib.Path(
+            r"C:\Users\Lamine\Desktop\Projet final\Application\frame"
+        )
 
         self.build_ui()
+        self._current_output_dir = self._default_output_dir
+        self._last_output_dir = str(self._default_output_dir)
 
     def build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -90,33 +95,42 @@ class FrameExtractorTab(QWidget):
         output_layout = QHBoxLayout(output_box)
         output_layout.setContentsMargins(12, 12, 12, 12)
         output_layout.setSpacing(8)
-        self.edit_output = QLineEdit()
-        self.edit_output.setPlaceholderText("Ex: C:/…/frames")
+        self.edit_output = QLineEdit(str(self._default_output_dir))
+        self.edit_output.setReadOnly(True)
         self.edit_output.textChanged.connect(self.on_output_changed)
-        btn_pick_output = QPushButton("Choisir…")
-        btn_pick_output.clicked.connect(self.on_pick_output)
+        self.edit_output.setToolTip(
+            "Ce dossier sera utilisé automatiquement pour les images extraites."
+        )
+        self.btn_pick_output = QPushButton("Choisir…")
+        self.btn_pick_output.clicked.connect(self.on_pick_output)
+        self.btn_pick_output.setVisible(False)
         output_layout.addWidget(self.edit_output, 1)
-        output_layout.addWidget(btn_pick_output)
+        output_layout.addWidget(self.btn_pick_output)
         root.addWidget(output_box)
 
         options_box = QGroupBox("Options")
-        options_layout = QFormLayout(options_box)
+        options_layout = QHBoxLayout(options_box)
         options_layout.setContentsMargins(12, 12, 12, 12)
-        options_layout.setSpacing(6)
+        options_layout.setSpacing(16)
+
+        left_form = QFormLayout()
+        left_form.setSpacing(10)
+        right_form = QFormLayout()
+        right_form.setSpacing(10)
 
         self.edit_prefix = QLineEdit("frame_")
-        options_layout.addRow("Préfixe des fichiers", self.edit_prefix)
+        left_form.addRow("Préfixe des fichiers", self.edit_prefix)
 
         self.cmb_format = QComboBox()
         self.cmb_format.addItem("JPG (JPEG)", "jpg")
         self.cmb_format.addItem("PNG", "png")
-        options_layout.addRow("Format", self.cmb_format)
+        left_form.addRow("Format", self.cmb_format)
 
         self.spin_step = QSpinBox()
         self.spin_step.setRange(1, 500)
         self.spin_step.setValue(1)
         self.spin_step.setSuffix(" image(s)")
-        options_layout.addRow("Garder 1 image toutes les", self.spin_step)
+        left_form.addRow("Garder 1 image toutes les", self.spin_step)
 
         time_row = QHBoxLayout()
         self.spin_start = QDoubleSpinBox()
@@ -133,7 +147,9 @@ class FrameExtractorTab(QWidget):
         time_row.addWidget(self.spin_start)
         time_row.addWidget(QLabel("Fin"))
         time_row.addWidget(self.spin_end)
-        options_layout.addRow("Fenêtre temporelle", time_row)
+        time_widget = QWidget()
+        time_widget.setLayout(time_row)
+        right_form.addRow("Fenêtre temporelle", time_widget)
 
         self.chk_resize = QCheckBox("Redimensionner")
         self.chk_resize.stateChanged.connect(self.on_resize_toggled)
@@ -152,19 +168,22 @@ class FrameExtractorTab(QWidget):
         resize_row.addStretch(1)
         resize_widget = QWidget()
         resize_widget.setLayout(resize_row)
-        options_layout.addRow(self.chk_resize, resize_widget)
+        right_form.addRow(self.chk_resize, resize_widget)
 
         self.spin_quality = QSpinBox()
         self.spin_quality.setRange(10, 100)
         self.spin_quality.setValue(95)
         self.spin_quality.setSuffix(" %")
-        options_layout.addRow("Qualité (JPG)", self.spin_quality)
+        right_form.addRow("Qualité (JPG)", self.spin_quality)
 
         self.spin_preview = QSpinBox()
         self.spin_preview.setRange(1, 50)
         self.spin_preview.setValue(5)
         self.spin_preview.setSuffix(" image(s)")
-        options_layout.addRow("Aperçu toutes les", self.spin_preview)
+        left_form.addRow("Aperçu toutes les", self.spin_preview)
+
+        options_layout.addLayout(left_form, 1)
+        options_layout.addLayout(right_form, 1)
 
         root.addWidget(options_box)
 
@@ -174,7 +193,8 @@ class FrameExtractorTab(QWidget):
         progress_layout.setSpacing(6)
 
         self.progress = QProgressBar()
-        self.progress.setRange(0, 0)
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
         self.lab_progress = QLabel("En attente…")
         progress_layout.addWidget(self.progress)
         progress_layout.addWidget(self.lab_progress)
@@ -236,9 +256,6 @@ class FrameExtractorTab(QWidget):
         path = pathlib.Path(text).expanduser()
         if path.exists():
             self._last_video_dir = str(path.parent)
-            default_output = path.parent / f"{path.stem}_frames"
-            if not self.edit_output.text().strip():
-                self.edit_output.setText(str(default_output))
             self.update_video_info(path)
         else:
             self.lab_video_info.setText("Aucune vidéo sélectionnée.")
@@ -338,7 +355,7 @@ class FrameExtractorTab(QWidget):
         )
 
         self.logs.clear()
-        self.progress.setRange(0, 0)
+        self.progress.setRange(0, 1)
         self.progress.setValue(0)
         self.lab_progress.setText("Préparation…")
         self.preview.setText("Aucun aperçu disponible")
@@ -390,6 +407,8 @@ class FrameExtractorTab(QWidget):
     def on_worker_finished(self, ok: bool, saved: int, message: str) -> None:
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
         if ok:
             self.lab_progress.setText(f"Terminé — {saved} image(s).")
             if saved:
