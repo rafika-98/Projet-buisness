@@ -8,7 +8,13 @@ from typing import Dict, Optional
 
 from yt_dlp import YoutubeDL
 
-from core.download_core import Task, move_final_outputs, normalize_url
+from core.download_core import (
+    Task,
+    extract_basic_info,
+    move_final_outputs,
+    normalize_url,
+    sanitize_filename,
+)
 from paths import DOWNLOAD_ARCHIVE, get_audio_dir, get_video_dir
 
 YOUTUBE_REGEX = re.compile(
@@ -18,8 +24,36 @@ YOUTUBE_REGEX = re.compile(
 
 _DEFAULT_VIDEO_FORMAT = "bestvideo[ext=mp4][vcodec*=avc1]+bestaudio[ext=m4a]/best[ext=mp4]"
 _DEFAULT_AUDIO_FORMAT = "bestaudio/best"
-_FOLDER_TMPL = "%(title).200s [%(id)s]"
-_FILE_TMPL = "%(title).200s [%(id)s].%(ext)s"
+_FOLDER_TMPL = "%(title).80s [%(id)s]"
+_FILE_TMPL = "%(title).80s [%(id)s].%(ext)s"
+_TITLE_MAX_LENGTH = 80
+_HASHTAG_PATTERN = re.compile(r"(?:^|\s)[#＃][^#＃\s]+")
+
+
+def _sanitize_title(value: Optional[str]) -> str:
+    if not value:
+        return ""
+
+    cleaned = _HASHTAG_PATTERN.sub(" ", value)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    if not cleaned:
+        return ""
+
+    if len(cleaned) > _TITLE_MAX_LENGTH:
+        cleaned = cleaned[:_TITLE_MAX_LENGTH].rstrip()
+
+    cleaned = sanitize_filename(cleaned)
+    cleaned = cleaned.replace("%", "％")
+    return cleaned
+
+
+def _custom_outtmpl(platform: str, title: str) -> str:
+    base_dir = get_video_dir(platform)
+    safe_title = title or "file"
+    folder = f"{safe_title} [%(id)s]"
+    filename = f"{safe_title} [%(id)s].%(ext)s"
+    return str(base_dir / folder / filename)
 
 
 def _base_outtmpl(platform: str) -> str:
@@ -60,6 +94,21 @@ def _run_direct_download(url: str, opts: Dict[str, object], *, expect_audio: boo
     task = Task(url=url, platform="youtube")
     local_opts = dict(opts)
     captured: Dict[str, Optional[str]] = {"filename": None}
+
+    default_outtmpl = str(local_opts.get("outtmpl") or "")
+    try:
+        probe = extract_basic_info(url)
+    except Exception:
+        probe = {}
+
+    custom_title = ""
+    if isinstance(probe, dict):
+        custom_title = _sanitize_title(probe.get("title"))
+
+    if custom_title:
+        local_opts["outtmpl"] = _custom_outtmpl("youtube", custom_title)
+    elif default_outtmpl:
+        local_opts["outtmpl"] = default_outtmpl
 
     def _hook(data: Dict[str, object]) -> None:
         if data.get("status") == "finished":
