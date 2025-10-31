@@ -1065,7 +1065,7 @@ class Main(QWidget):
         tabs.addTab(self.youtube_tab, "YouTube")
         tabs.addTab(self.tiktok_tab, "TikTok")
         tabs.addTab(self.transcription_tab, "Transcription")
-        tabs.addTab(self.frame_extractor_tab, "À venir 3")
+        tabs.addTab(self.frame_extractor_tab, "Création Frame")
         tabs.addTab(ComingSoonTab("À venir 4"), "À venir 4")
         tabs.addTab(ComingSoonTab("À venir 5"), "À venir 5")
         tabs.addTab(ComingSoonTab("À venir 6"), "À venir 6")
