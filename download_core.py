@@ -13,7 +13,15 @@ from PySide6.QtCore import QThread, Signal
 from yt_dlp import YoutubeDL
 
 from config import DEFAULT_CONFIG, load_config
-from paths import AUDIOS_DIR, OUT_DIR, VIDEOS_DIR, get_audio_dir, get_video_dir
+from paths import (
+    AUDIOS_DIR,
+    OUT_DIR,
+    VIDEOS_DIR,
+    delete_dir_if_empty,
+    get_audio_dir,
+    get_video_dir,
+    is_path_in_dir,
+)
 
 BROWSER_TRY_ORDER = ("edge", "chrome", "brave", "vivaldi", "opera", "chromium", "firefox")
 
@@ -557,6 +565,8 @@ def move_final_outputs(task: Task) -> dict:
     if not task.video_id or not task.filename:
         return moved
 
+    src_dir: Optional[pathlib.Path] = None
+
     try:
         platform = (task.platform or "").strip().lower()
         audio_dir = get_audio_dir(platform or "youtube")
@@ -615,6 +625,13 @@ def move_final_outputs(task: Task) -> dict:
                 task.final_audio_path = str(dst)
     except Exception:
         pass
+
+    try:
+        if src_dir and is_path_in_dir(src_dir, OUT_DIR):
+            delete_dir_if_empty(src_dir)
+    except Exception:
+        pass
+
     return moved
 
 

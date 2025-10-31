@@ -41,7 +41,7 @@ from download_core import (
 )
 from module_tiktok import TIKTOK_REGEX, build_download_options as build_tiktok_options
 from module_youtube import YOUTUBE_REGEX, build_download_options as build_youtube_options
-from paths import delete_dir_if_empty, get_video_dir
+from paths import get_video_dir
 
 
 class InspectWorker(QThread):
@@ -578,13 +578,6 @@ class YoutubeTab(QWidget):
             moved = move_final_outputs(task)
             self.cleanup_residuals(task)
             cleanup_orphans_in_outputs(task)
-            try:
-                if task.filename:
-                    subdir = OUT_DIR / pathlib.Path(task.filename).parent.name
-                    delete_dir_if_empty(subdir)
-            except Exception:
-                pass
-
             audio_path = moved.get("audio") or task.final_audio_path
             if not audio_path:
                 audio_path = ensure_audio(task)
