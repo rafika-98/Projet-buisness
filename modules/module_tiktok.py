@@ -2,19 +2,15 @@
 
 from __future__ import annotations
 
+import os
 import pathlib
 import re
+from datetime import datetime
 from typing import Dict, Optional
 
 from yt_dlp import YoutubeDL
 
-from core.download_core import (
-    Task,
-    extract_basic_info,
-    move_final_outputs,
-    normalize_url,
-    sanitize_filename,
-)
+from core.download_core import Task, move_final_outputs, normalize_url
 from paths import DOWNLOAD_ARCHIVE_TT, get_audio_dir, get_video_dir
 
 TIKTOK_REGEX = re.compile(
@@ -22,132 +18,42 @@ TIKTOK_REGEX = re.compile(
     re.IGNORECASE,
 )
 
-_DEFAULT_VIDEO_FORMAT = "best[ext=mp4]/best"
+_DEFAULT_VIDEO_FORMAT = "mp4/bestaudio/best"
 _DEFAULT_AUDIO_FORMAT = "bestaudio/best"
-_FOLDER_TMPL = "%(title).80s [%(id)s]"
-_FILE_TMPL = "%(title).80s [%(id)s].%(ext)s"
-_TITLE_MAX_LENGTH = 80
-_HASHTAG_PATTERN = re.compile(r"(?:^|\s)[#＃][^#＃\s]+")
 
 
-def _sanitize_title(value: Optional[str]) -> str:
-    if not value:
-        return ""
-
-    cleaned = _HASHTAG_PATTERN.sub(" ", value)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-
-    if not cleaned:
-        return ""
-
-    if len(cleaned) > _TITLE_MAX_LENGTH:
-        cleaned = cleaned[:_TITLE_MAX_LENGTH].rstrip()
-
-    cleaned = sanitize_filename(cleaned)
-    cleaned = cleaned.replace("%", "％")
-    return cleaned
+def _timestamped_outtmpl(base_dir: pathlib.Path, prefix: str) -> str:
+    base_dir.mkdir(parents=True, exist_ok=True)
+    date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # On conserve l’identifiant dans le nom pour les traitements aval (archives/cleanups)
+    return str(base_dir / f"{prefix}_{date_str} [%(id)s].%(ext)s")
 
 
-def _custom_outtmpl(platform: str, title: str) -> str:
-    base_dir = get_video_dir(platform)
-    safe_title = title or "file"
-    folder = f"{safe_title} [%(id)s]"
-    filename = f"{safe_title} [%(id)s].%(ext)s"
-    return str(base_dir / folder / filename)
-
-
-def _base_outtmpl(platform: str) -> str:
-    base_dir = get_video_dir(platform)
-    return str(base_dir / _FOLDER_TMPL / _FILE_TMPL)
-
-
-def build_download_options(task: Task, *, format_override: Optional[str] = None) -> Dict[str, object]:
-    """Construit les options yt-dlp pour une tâche TikTok."""
-
-    fmt = format_override or task.selected_fmt or _DEFAULT_VIDEO_FORMAT
-    outtmpl = _base_outtmpl("tiktok")
-    get_audio_dir("tiktok")
-
+def _prepare_common_opts(outtmpl: str, *, fmt: str) -> Dict[str, object]:
     return {
         "outtmpl": outtmpl,
-        "windowsfilenames": True,
         "format": fmt,
         "merge_output_format": "mp4",
-        "postprocessors": [
-            {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"},
-            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
-        ],
-        "keepvideo": True,
-        "quiet": True,
-        "no_warnings": True,
-        "continuedl": True,
-        "concurrent_fragment_downloads": 4,
         "noplaylist": True,
+        "continuedl": True,
         "download_archive": str(DOWNLOAD_ARCHIVE_TT),
         "nooverwrites": True,
         "overwrites": False,
     }
 
 
-def _run_direct_download(url: str, opts: Dict[str, object], *, expect_audio: bool = False) -> pathlib.Path:
-    task = Task(url=url, platform="tiktok")
-    local_opts = dict(opts)
-    captured: Dict[str, Optional[str]] = {"filename": None}
+def build_download_options(task: Task, *, format_override: Optional[str] = None) -> Dict[str, object]:
+    """Construit les options yt-dlp pour une tâche TikTok."""
 
-    default_outtmpl = str(local_opts.get("outtmpl") or "")
-    try:
-        probe = extract_basic_info(url)
-    except Exception:
-        probe = {}
+    fmt = format_override or task.selected_fmt or _DEFAULT_VIDEO_FORMAT
+    outtmpl = _timestamped_outtmpl(get_video_dir("tiktok"), "tiktok")
+    get_audio_dir("tiktok")
+    return _prepare_common_opts(outtmpl, fmt=fmt)
 
-    custom_title = ""
-    if isinstance(probe, dict):
-        custom_title = _sanitize_title(probe.get("title"))
 
-    if custom_title:
-        local_opts["outtmpl"] = _custom_outtmpl("tiktok", custom_title)
-    elif default_outtmpl:
-        local_opts["outtmpl"] = default_outtmpl
-
-    def _hook(data: Dict[str, object]) -> None:
-        if data.get("status") == "finished":
-            filename = data.get("filename")
-            if isinstance(filename, str):
-                captured["filename"] = filename
-
-    hooks = list(local_opts.get("progress_hooks") or [])
-    hooks.append(_hook)
-    local_opts["progress_hooks"] = hooks
-
-    with YoutubeDL(local_opts) as ydl:
-        info = ydl.extract_info(normalize_url(url), download=True)
-
-    if info and info.get("entries"):
-        info = info["entries"][0]
-
-    filepath: Optional[str] = None
-    if isinstance(info, dict):
-        task.video_id = info.get("id")
-        requested = info.get("requested_downloads") or []
-        for entry in requested:
-            filename = entry.get("filepath") or entry.get("filename")
-            if filename:
-                filepath = filename
-                break
-        if not filepath:
-            filename = info.get("_filename") or info.get("filepath")
-            if isinstance(filename, str):
-                filepath = filename
-
-    if not filepath:
-        filepath = captured["filename"]
-
-    if not filepath:
-        raise RuntimeError("Impossible de déterminer le fichier téléchargé pour TikTok.")
-
-    task.filename = filepath
+def _finalize_download(task: Task, info: dict, expect_audio: bool) -> pathlib.Path:
+    task.video_id = (info or {}).get("id")
     moved = move_final_outputs(task)
-
     target = moved.get("audio") if expect_audio else moved.get("video")
     if expect_audio and not target:
         target = moved.get("audio")
@@ -156,19 +62,58 @@ def _run_direct_download(url: str, opts: Dict[str, object], *, expect_audio: boo
     return pathlib.Path(target)
 
 
-def download_tiktok_video(url: str) -> pathlib.Path:
+def _direct_download(url: str, opts: Dict[str, object], *, expect_audio: bool = False) -> pathlib.Path:
+    task = Task(url=url, platform="tiktok")
+    local_opts = dict(opts)
+
+    def _hook(data: Dict[str, object]) -> None:
+        if data.get("status") == "finished":
+            filename = data.get("filename")
+            if isinstance(filename, str):
+                task.filename = filename
+
+    hooks = list(local_opts.get("progress_hooks") or [])
+    hooks.append(_hook)
+    local_opts["progress_hooks"] = hooks
+
+    with YoutubeDL(local_opts) as ydl:
+        info = ydl.extract_info(normalize_url(url), download=True)
+        if info and info.get("entries"):
+            info = info["entries"][0]
+        if not task.filename:
+            try:
+                task.filename = ydl.prepare_filename(info)
+            except Exception:
+                task.filename = ""
+
+    if not task.filename:
+        raise RuntimeError("Impossible de déterminer le fichier téléchargé pour TikTok.")
+
+    # Harmonise l’extension si yt-dlp a remuxé le flux
+    if not task.filename.lower().endswith(".mp4"):
+        base, _ = os.path.splitext(task.filename)
+        candidate = f"{base}.mp4"
+        if os.path.exists(candidate):
+            task.filename = candidate
+
+    return _finalize_download(task, info if isinstance(info, dict) else {}, expect_audio)
+
+
+def download_tiktok_video(url: str, output_dir: Optional[str | os.PathLike[str]] = None) -> pathlib.Path:
     """Télécharge une vidéo TikTok et retourne le chemin final."""
 
-    opts = build_download_options(Task(url=url, platform="tiktok"))
-    return _run_direct_download(url, opts, expect_audio=False)
+    base_dir = pathlib.Path(output_dir) if output_dir else get_video_dir("tiktok")
+    outtmpl = _timestamped_outtmpl(base_dir, "tiktok")
+    opts = _prepare_common_opts(outtmpl, fmt=_DEFAULT_VIDEO_FORMAT)
+    return _direct_download(url, opts, expect_audio=False)
 
 
-def download_tiktok_audio(url: str) -> pathlib.Path:
+def download_tiktok_audio(url: str, output_dir: Optional[str | os.PathLike[str]] = None) -> pathlib.Path:
     """Télécharge uniquement l’audio d’une vidéo TikTok."""
 
-    task = Task(url=url, platform="tiktok")
-    opts = build_download_options(task, format_override=_DEFAULT_AUDIO_FORMAT)
+    base_dir = pathlib.Path(output_dir) if output_dir else get_audio_dir("tiktok")
+    outtmpl = _timestamped_outtmpl(base_dir, "tiktok_audio")
+    opts = _prepare_common_opts(outtmpl, fmt=_DEFAULT_AUDIO_FORMAT)
     opts = dict(opts)
     opts["keepvideo"] = False
-    opts["format"] = _DEFAULT_AUDIO_FORMAT
-    return _run_direct_download(url, opts, expect_audio=True)
+    return _direct_download(url, opts, expect_audio=True)
