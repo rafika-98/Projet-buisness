@@ -1065,6 +1065,10 @@ class Main(QWidget):
         tabs.addTab(self.transcription_tab, "Transcription")
         tabs.addTab(ComingSoonTab("À venir 3"), "À venir 3")
         tabs.addTab(ComingSoonTab("À venir 4"), "À venir 4")
+        tabs.addTab(ComingSoonTab("À venir 5"), "À venir 5")
+        tabs.addTab(ComingSoonTab("À venir 6"), "À venir 6")
+        tabs.addTab(ComingSoonTab("À venir 7"), "À venir 7")
+        tabs.addTab(ComingSoonTab("À venir 8"), "À venir 8")
         tabs.addTab(self.settings_tab, "Paramètres généraux")
         tabs.addTab(self.serveur_tab, "Serveur")
         self.tabs = tabs
