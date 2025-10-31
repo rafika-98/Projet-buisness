@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from config import OUT_DIR
-from download_core import (
+from core.download_core import (
     Task,
     DownloadWorker,
     cleanup_orphans_in_outputs,
@@ -39,8 +39,14 @@ from download_core import (
     move_final_outputs,
     pick_best_audio,
 )
-from module_tiktok import TIKTOK_REGEX, build_download_options as build_tiktok_options
-from module_youtube import YOUTUBE_REGEX, build_download_options as build_youtube_options
+from modules.module_tiktok import (
+    TIKTOK_REGEX,
+    build_download_options as build_tiktok_options,
+)
+from modules.module_youtube import (
+    YOUTUBE_REGEX,
+    build_download_options as build_youtube_options,
+)
 from paths import get_video_dir
 
 

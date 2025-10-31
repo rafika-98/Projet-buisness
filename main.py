@@ -31,11 +31,11 @@ from PySide6.QtWidgets import (
 )
 
 from config import DEFAULT_CONFIG, load_config, save_config
-from download_core import CommandWorker, Task
+from core.download_core import CommandWorker, Task
 from flask_notify import start_notification_server
-from telegram_worker import TelegramWorker
-from ui_frame_extractor_tab import FrameExtractorTab
-from ui_youtube_tab import TikTokTab, YoutubeTab, themed_icon
+from workers.telegram_worker import TelegramWorker
+from ui.ui_frame_extractor_tab import FrameExtractorTab
+from ui.ui_youtube_tab import TikTokTab, YoutubeTab, themed_icon
 
 try:  # thème optionnel moderne
     import qdarktheme

@@ -27,7 +27,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from module_frame_extractor import FrameExtractionOptions, FrameExtractionWorker
+from modules.module_frame_extractor import (
+    FrameExtractionOptions,
+    FrameExtractionWorker,
+)
 
 
 def _open_dir(path: pathlib.Path) -> None:

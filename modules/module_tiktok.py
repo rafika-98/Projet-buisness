@@ -1,4 +1,4 @@
-"""Fonctions utilitaires pour les téléchargements YouTube."""
+"""Fonctions utilitaires pour les téléchargements TikTok."""
 
 from __future__ import annotations
 
@@ -8,15 +8,15 @@ from typing import Dict, Optional
 
 from yt_dlp import YoutubeDL
 
-from download_core import Task, move_final_outputs, normalize_url
-from paths import DOWNLOAD_ARCHIVE, get_audio_dir, get_video_dir
+from core.download_core import Task, move_final_outputs, normalize_url
+from paths import DOWNLOAD_ARCHIVE_TT, get_audio_dir, get_video_dir
 
-YOUTUBE_REGEX = re.compile(
-    r"(https?://(?:www\.)?(?:youtube\.com/watch\?\S*?v=[^\s&]+|youtu\.be/[^\s/?#]+)[^\s]*)",
+TIKTOK_REGEX = re.compile(
+    r"(https?://(?:www\.)?(?:tiktok\.com/.+?/video/\d+|vt\.tiktok\.com/\S+|vm\.tiktok\.com/\S+))",
     re.IGNORECASE,
 )
 
-_DEFAULT_VIDEO_FORMAT = "bestvideo[ext=mp4][vcodec*=avc1]+bestaudio[ext=m4a]/best[ext=mp4]"
+_DEFAULT_VIDEO_FORMAT = "best[ext=mp4]/best"
 _DEFAULT_AUDIO_FORMAT = "bestaudio/best"
 _FOLDER_TMPL = "%(title).200s [%(id)s]"
 _FILE_TMPL = "%(title).200s [%(id)s].%(ext)s"
@@ -28,12 +28,11 @@ def _base_outtmpl(platform: str) -> str:
 
 
 def build_download_options(task: Task, *, format_override: Optional[str] = None) -> Dict[str, object]:
-    """Construit les options yt-dlp pour une tâche YouTube."""
+    """Construit les options yt-dlp pour une tâche TikTok."""
 
     fmt = format_override or task.selected_fmt or _DEFAULT_VIDEO_FORMAT
-    outtmpl = _base_outtmpl("youtube")
-    # S'assure que les dossiers cibles existent
-    get_audio_dir("youtube")
+    outtmpl = _base_outtmpl("tiktok")
+    get_audio_dir("tiktok")
 
     return {
         "outtmpl": outtmpl,
@@ -50,14 +49,14 @@ def build_download_options(task: Task, *, format_override: Optional[str] = None)
         "continuedl": True,
         "concurrent_fragment_downloads": 4,
         "noplaylist": True,
-        "download_archive": str(DOWNLOAD_ARCHIVE),
+        "download_archive": str(DOWNLOAD_ARCHIVE_TT),
         "nooverwrites": True,
         "overwrites": False,
     }
 
 
 def _run_direct_download(url: str, opts: Dict[str, object], *, expect_audio: bool = False) -> pathlib.Path:
-    task = Task(url=url, platform="youtube")
+    task = Task(url=url, platform="tiktok")
     local_opts = dict(opts)
     captured: Dict[str, Optional[str]] = {"filename": None}
 
@@ -95,7 +94,7 @@ def _run_direct_download(url: str, opts: Dict[str, object], *, expect_audio: boo
         filepath = captured["filename"]
 
     if not filepath:
-        raise RuntimeError("Impossible de déterminer le fichier téléchargé pour YouTube.")
+        raise RuntimeError("Impossible de déterminer le fichier téléchargé pour TikTok.")
 
     task.filename = filepath
     moved = move_final_outputs(task)
@@ -104,21 +103,21 @@ def _run_direct_download(url: str, opts: Dict[str, object], *, expect_audio: boo
     if expect_audio and not target:
         target = moved.get("audio")
     if not target:
-        raise RuntimeError("Téléchargement YouTube terminé mais aucun fichier final n’a été trouvé.")
+        raise RuntimeError("Téléchargement TikTok terminé mais aucun fichier final n’a été trouvé.")
     return pathlib.Path(target)
 
 
-def download_youtube_video(url: str) -> pathlib.Path:
-    """Télécharge une vidéo YouTube et retourne le chemin final."""
+def download_tiktok_video(url: str) -> pathlib.Path:
+    """Télécharge une vidéo TikTok et retourne le chemin final."""
 
-    opts = build_download_options(Task(url=url, platform="youtube"))
+    opts = build_download_options(Task(url=url, platform="tiktok"))
     return _run_direct_download(url, opts, expect_audio=False)
 
 
-def download_youtube_audio(url: str) -> pathlib.Path:
-    """Télécharge uniquement l’audio d’une vidéo YouTube."""
+def download_tiktok_audio(url: str) -> pathlib.Path:
+    """Télécharge uniquement l’audio d’une vidéo TikTok."""
 
-    task = Task(url=url, platform="youtube")
+    task = Task(url=url, platform="tiktok")
     opts = build_download_options(task, format_override=_DEFAULT_AUDIO_FORMAT)
     opts = dict(opts)
     opts["keepvideo"] = False

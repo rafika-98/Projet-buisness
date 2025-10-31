@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from PySide6.QtCore import QThread, Signal
 from yt_dlp import YoutubeDL
 
-from download_core import (
+from core.download_core import (
     estimate_size,
     human_size,
     list_video_formats,
