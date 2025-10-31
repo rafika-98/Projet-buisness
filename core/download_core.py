@@ -497,10 +497,12 @@ class CommandWorker(QThread):
 
 
 _RESERVED = '<>:"/\\|?*'
+_HASHTAG_PATTERN = re.compile(r"(?:^|\s)[#＃][^#＃\s]+")
 
 
 def sanitize_filename(name: str) -> str:
-    safe = "".join("_" if ch in _RESERVED else ch for ch in name)
+    cleaned = _HASHTAG_PATTERN.sub(" ", name)
+    safe = "".join("_" if ch in _RESERVED else ch for ch in cleaned)
     safe = re.sub(r"\s+", " ", safe).strip()
     if len(safe) > 150:
         safe = safe[:150].rstrip()
