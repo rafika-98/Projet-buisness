@@ -13,17 +13,7 @@ from PySide6.QtCore import QThread, Signal
 from yt_dlp import YoutubeDL
 
 from config import DEFAULT_CONFIG, load_config
-from paths import AUDIOS_DIR, DOWNLOAD_ARCHIVE, DOWNLOAD_ARCHIVE_TT, OUT_DIR, VIDEOS_DIR
-
-YOUTUBE_REGEX = re.compile(
-    r"(https?://(?:www\.)?(?:youtube\.com/watch\?\S*?v=[^\s&]+|youtu\.be/[^\s/?#]+)[^\s]*)",
-    re.IGNORECASE,
-)
-
-TIKTOK_REGEX = re.compile(
-    r"(https?://(?:www\.)?(?:tiktok\.com/.+?/video/\d+|vt\.tiktok\.com/\S+|vm\.tiktok\.com/\S+))",
-    re.IGNORECASE,
-)
+from paths import AUDIOS_DIR, OUT_DIR, VIDEOS_DIR, get_audio_dir, get_video_dir
 
 BROWSER_TRY_ORDER = ("edge", "chrome", "brave", "vivaldi", "opera", "chromium", "firefox")
 
@@ -254,6 +244,7 @@ class Task:
     selected_fmt: Optional[str] = None
     final_audio_path: Optional[str] = None
     final_video_path: Optional[str] = None
+    platform: str = "youtube"
     source: str = "ui"
     chat_id: Optional[int] = None
 
@@ -439,7 +430,7 @@ class DownloadWorker(QThread):
 
                 if reused_info and retcode == 0:
                     video_id = reused_info.get("id") or ""
-                    existing = find_existing_outputs(video_id)
+                    existing = find_existing_outputs(video_id, self.task.platform)
                     if (not video_id) or (not existing.get("audio") and not existing.get("video")):
                         raise RuntimeError(
                             "Téléchargement déjà enregistré dans l’archive mais aucun fichier final n’a été retrouvé. "
@@ -520,7 +511,7 @@ def _unique_path(dst: pathlib.Path) -> pathlib.Path:
         i += 1
 
 
-def find_existing_outputs(video_id: str) -> dict:
+def find_existing_outputs(video_id: str, platform: Optional[str] = None) -> dict:
     found = {"audio": None, "video": None}
     if not video_id:
         return found
@@ -538,12 +529,15 @@ def find_existing_outputs(video_id: str) -> dict:
     audio_exts = {".mp3", ".m4a", ".wav", ".ogg", ".flac"}
     video_exts = {".mp4", ".mkv", ".webm", ".mov"}
 
+    audio_base = AUDIOS_DIR if not platform else get_audio_dir(platform)
+    video_base = VIDEOS_DIR if not platform else get_video_dir(platform)
+
     try:
         audio_candidates = [
-            p for p in AUDIOS_DIR.glob(f"*{token}*") if p.is_file() and p.suffix.lower() in audio_exts
+            p for p in audio_base.glob(f"*{token}*") if p.is_file() and p.suffix.lower() in audio_exts
         ]
         video_candidates = [
-            p for p in VIDEOS_DIR.glob(f"*{token}*") if p.is_file() and p.suffix.lower() in video_exts
+            p for p in video_base.glob(f"*{token}*") if p.is_file() and p.suffix.lower() in video_exts
         ]
 
         audio_path = _pick_latest(audio_candidates)
@@ -564,6 +558,9 @@ def move_final_outputs(task: Task) -> dict:
         return moved
 
     try:
+        platform = (task.platform or "").strip().lower()
+        audio_dir = get_audio_dir(platform or "youtube")
+        video_dir = get_video_dir(platform or "youtube")
         src_dir = pathlib.Path(task.filename).parent
         token = f"[{task.video_id}]"
 
@@ -590,9 +587,9 @@ def move_final_outputs(task: Task) -> dict:
                     token_segment = stem[start : end + 1]
 
             if ext == ".mp3":
-                base_dir = AUDIOS_DIR
+                base_dir = audio_dir
             else:
-                base_dir = VIDEOS_DIR
+                base_dir = video_dir
 
             prefix = stem
             if token_segment:
@@ -610,7 +607,7 @@ def move_final_outputs(task: Task) -> dict:
             except Exception:
                 shutil.move(str(p), str(dst))
 
-            if base_dir == VIDEOS_DIR:
+            if base_dir == video_dir:
                 moved["video"] = str(dst)
                 task.final_video_path = str(dst)
             else:
@@ -625,8 +622,10 @@ def cleanup_orphans_in_outputs(task: Task) -> None:
     if not task.video_id:
         return
     token = f"[{task.video_id}]"
+    platform = (task.platform or "").strip().lower()
+    audio_dir = get_audio_dir(platform or "youtube")
     try:
-        for p in AUDIOS_DIR.glob(f"*{token}*"):
+        for p in audio_dir.glob(f"*{token}*"):
             if not p.is_file():
                 continue
             ext = p.suffix.lower()
@@ -650,7 +649,9 @@ def ensure_audio(task: Task) -> Optional[str]:
     src = pathlib.Path(task.final_video_path)
     base = src.stem
     safe_base = sanitize_filename(base)
-    dst = _unique_path(AUDIOS_DIR / f"{safe_base}.mp3")
+    platform = (task.platform or "").strip().lower()
+    audio_dir = get_audio_dir(platform or "youtube")
+    dst = _unique_path(audio_dir / f"{safe_base}.mp3")
 
     try:
         proc = subprocess.run(
