@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import re
 from typing import Optional
 
 import cv2
@@ -32,6 +33,13 @@ from modules.module_frame_extractor import (
     FrameExtractionWorker,
 )
 
+try:  # pragma: no cover - optional dependency on Windows
+    from flask_notify import _send_windows_notification as send_windows_notification
+except Exception:  # pragma: no cover - fallback when notification helper is unavailable
+
+    def send_windows_notification(message: str) -> None:  # type: ignore[unused-argument]
+        return
+
 
 def _open_dir(path: pathlib.Path) -> None:
     try:
@@ -59,6 +67,8 @@ class FrameExtractorTab(QWidget):
         self._default_output_dir = pathlib.Path(
             r"C:\Users\Lamine\Desktop\Projet final\Application\frame"
         )
+        self._default_output_dir.mkdir(parents=True, exist_ok=True)
+        self._output_locked_to_video = True
 
         self.build_ui()
         self._current_output_dir = self._default_output_dir
@@ -253,6 +263,39 @@ class FrameExtractorTab(QWidget):
 
         root.addStretch(1)
 
+    def _sanitize_video_name(self, path: pathlib.Path) -> str:
+        sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", path.stem)
+        sanitized = sanitized.strip("._-")
+        return sanitized or "video"
+
+    def _suggest_output_dir_for(self, video_path: pathlib.Path) -> pathlib.Path:
+        base = self._default_output_dir
+        name = self._sanitize_video_name(video_path)
+        candidate = base / name
+        index = 1
+        while candidate.exists():
+            candidate = base / f"{name}_{index:02d}"
+            index += 1
+        return candidate
+
+    def _apply_suggested_output(self, video_path: pathlib.Path) -> None:
+        suggested = self._suggest_output_dir_for(video_path)
+        self.edit_output.setText(str(suggested))
+
+    def _notify_completion(self, saved: int) -> None:
+        directory = self._current_output_dir
+        if saved:
+            message = f"Extraction terminée — {saved} image(s) enregistrée(s)."
+        else:
+            message = "Extraction terminée — aucune image enregistrée."
+        if directory:
+            message += f"\nDossier : {directory}"
+        QMessageBox.information(self, "Création de frames", message)
+        try:
+            send_windows_notification("Extraction des frames terminée.")
+        except Exception:
+            pass
+
     def dragEnterEvent(self, event) -> None:  # type: ignore[override]
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
@@ -277,6 +320,8 @@ class FrameExtractorTab(QWidget):
         if path.exists():
             self._last_video_dir = str(path.parent)
             self.update_video_info(path)
+            if self._output_locked_to_video:
+                self._apply_suggested_output(path)
         else:
             self.lab_video_info.setText("Aucune vidéo sélectionnée.")
 
@@ -318,6 +363,7 @@ class FrameExtractorTab(QWidget):
         start_dir = self._last_output_dir or (self._last_video_dir or str(pathlib.Path.home()))
         path = QFileDialog.getExistingDirectory(self, "Dossier de sortie", start_dir)
         if path:
+            self._output_locked_to_video = False
             self.edit_output.setText(path)
 
     def on_time_changed(self) -> None:
@@ -343,6 +389,9 @@ class FrameExtractorTab(QWidget):
         if not video_path.exists():
             QMessageBox.warning(self, "Vidéo manquante", "Sélectionne une vidéo valide.")
             return
+
+        if self._output_locked_to_video:
+            self._apply_suggested_output(video_path)
 
         output_dir_text = self.edit_output.text().strip()
         if not output_dir_text:
@@ -435,6 +484,7 @@ class FrameExtractorTab(QWidget):
                 self.logs.append("Extraction terminée avec succès.")
             else:
                 self.logs.append("Aucune image extraite. Vérifie les paramètres (intervalle, fenêtre temporelle…).")
+            self._notify_completion(saved)
             if self._current_output_dir:
                 self.sig_extraction_done.emit(str(self._current_output_dir))
         else:
