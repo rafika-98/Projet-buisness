@@ -222,7 +222,9 @@ class OcrTab(QWidget):
 
         btn_copy = QPushButton("Copy")
         btn_copy.setMaximumWidth(80)
-        btn_copy.clicked.connect(lambda _, text=result.prompt: self.copy_to_clipboard(text))
+        btn_copy.clicked.connect(
+            lambda _, text=result.prompt, target=label: self.copy_to_clipboard(text, target)
+        )
         row_layout.addWidget(btn_copy)
 
         self.results_layout.addWidget(container)
@@ -270,12 +272,14 @@ class OcrTab(QWidget):
         self.set_status("Paramètres enregistrés.")
         QMessageBox.information(self, "Paramètres", "Paramètres enregistrés.")
 
-    def copy_to_clipboard(self, text: str) -> None:
+    def copy_to_clipboard(self, text: str, target: Optional[QLabel] = None) -> None:
         app = QApplication.instance()
         clipboard = QApplication.clipboard() if app else None
         if clipboard:
             clipboard.setText(text or "")
             self.set_status("Prompt copié dans le presse-papier.")
+            if target is not None:
+                target.setStyleSheet("color: #2e7d32;")
         else:  # pragma: no cover - absence d'instance QApplication improbable
             self.set_status("Impossible de copier : presse-papier indisponible.")
 
