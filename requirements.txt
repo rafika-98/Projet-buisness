@@ -1,1 +1,3 @@
 python-telegram-bot>=21,<22
+mistralai>=1.0.0
+pillow>=9.0.0

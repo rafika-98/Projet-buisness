@@ -36,6 +36,7 @@ from flask_notify import start_notification_server
 from workers.telegram_worker import TelegramWorker
 from ui.ui_frame_extractor_tab import FrameExtractorTab
 from ui.ui_local_audio_tab import LocalAudioTab
+from ui.ui_ocr_tab import OcrTab
 from ui.ui_youtube_tab import TikTokTab, YoutubeTab, themed_icon
 
 try:  # thème optionnel moderne
@@ -1059,6 +1060,7 @@ class Main(QWidget):
         self.tiktok_tab = TikTokTab(app_ref=QApplication.instance())
         self.frame_extractor_tab = FrameExtractorTab()
         self.local_audio_tab = LocalAudioTab()
+        self.ocr_tab = OcrTab()
         self.transcription_tab = TranscriptionTab()
         self.serveur_tab = ServeurTab()
         self.settings_tab = SettingsTab(app_ref=self)
@@ -1068,8 +1070,8 @@ class Main(QWidget):
         tabs.addTab(self.tiktok_tab, "TikTok")
         tabs.addTab(self.transcription_tab, "Transcription")
         tabs.addTab(self.frame_extractor_tab, "Création Frame")
-        tabs.addTab(self.local_audio_tab, "À venir 4")
-        tabs.addTab(ComingSoonTab("À venir 5"), "À venir 5")
+        tabs.addTab(self.local_audio_tab, "MP3")
+        tabs.addTab(self.ocr_tab, "OCR")
         tabs.addTab(ComingSoonTab("À venir 6"), "À venir 6")
         tabs.addTab(ComingSoonTab("À venir 7"), "À venir 7")
         tabs.addTab(ComingSoonTab("À venir 8"), "À venir 8")
